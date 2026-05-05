@@ -2,7 +2,7 @@
 
 对应 Rust rbatis 的 ``crud!`` 宏：
 
-    struct BizActivity { id, name, ... }
+    struct BizActivity { id, name, create_time }
     crud!(BizActivity {});
 
 在 Python 中，继承 ``Model`` 并定义 ``__table__`` 即可。
@@ -13,6 +13,7 @@
 """
 
 import asyncio
+from datetime import datetime as dt
 from rbatis_py import RBatis, Model
 
 DB_URL = "sqlite://target/rbatis_crud.db"
@@ -23,8 +24,15 @@ DB_URL = "sqlite://target/rbatis_crud.db"
 #
 # Rust 版:
 #   #[derive(Serialize, Deserialize)]
-#   struct User { id: Option<i64>, name: Option<String>, ... }
+#   struct User { id: Option<i64>, name: Option<String>, age: Option<i32>, create_time: Option<DateTime> }
 #   crud!(User {});
+#
+# Python 版:
+#   字段类型标注仅用于提示，rbdc 类型会与 Python 原生类型自动转换:
+#     rbdc::DateTime  <->  datetime.datetime
+#     rbdc::Date      <->  datetime.date
+#     rbdc::Decimal   <->  decimal.Decimal
+#     rbdc::Uuid      <->  uuid.UUID
 # ============================================================
 class User(Model):
     """用户表"""
@@ -32,66 +40,62 @@ class User(Model):
     id: int | None = None
     name: str | None = None
     age: int | None = None
-
-
-class Article(Model):
-    """文章表"""
-    __table__ = "article"
-    id: int | None = None
-    title: str | None = None
-    user_id: int | None = None
+    create_time: dt | None = None
 
 
 async def main():
     db = RBatis()
     await db.link(DB_URL)
 
-    # ---------- 建表 ----------
-    await db.exec("DROP TABLE IF EXISTS article")
+    # 建表
     await db.exec("DROP TABLE IF EXISTS user")
     await db.exec(
         "CREATE TABLE IF NOT EXISTS user ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  name TEXT NOT NULL,"
-        "  age INTEGER"
-        ")"
-    )
-    await db.exec(
-        "CREATE TABLE IF NOT EXISTS article ("
-        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "  title TEXT NOT NULL,"
-        "  user_id INTEGER"
+        "  age INTEGER,"
+        "  create_time TEXT"
         ")"
     )
 
     # ============================================================
-    # insert — 插入单条
+    # insert — 插入单条（Python datetime 自动转 rbdc::DateTime）
     # ============================================================
-    affected = await User.insert(db, {"name": "Alice", "age": 30})
+    affected = await User.insert(db, {
+        "name": "Alice",
+        "age": 30,
+        "create_time": dt.now(),
+    })
     print(f"User.insert: {affected} row(s)")
 
-    affected = await User.insert(db, {"name": "Bob", "age": 25})
+    affected = await User.insert(db, {
+        "name": "Bob",
+        "age": 25,
+        "create_time": dt.now(),
+    })
     print(f"User.insert: {affected} row(s)")
-
-    affected = await Article.insert(db, {"title": "Hello Rust", "user_id": 1})
-    print(f"Article.insert: {affected} row(s)")
 
     # ============================================================
     # insert_batch — 批量插入
     # ============================================================
     users = [
-        {"name": "Charlie", "age": 35},
-        {"name": "David", "age": 28},
-        {"name": "Eve", "age": 22},
+        {"name": "Charlie", "age": 35, "create_time": dt.now()},
+        {"name": "David", "age": 28, "create_time": dt.now()},
+        {"name": "Eve", "age": 22, "create_time": dt.now()},
     ]
     affected = await User.insert_batch(db, users)
     print(f"\nUser.insert_batch ({len(users)} items): {affected} row(s)")
 
     # ============================================================
-    # select_by_map — 条件查询
+    # select_by_map — 条件查询（datetime 自动转回 Python datetime）
     # ============================================================
     rows = await User.select_by_map(db, {"name": "Alice"})
-    print(f"\nUser.select_by_map(name='Alice'): {rows}")
+    print(f"\nUser.select_by_map(name='Alice'):")
+    for r in rows:
+        print(f"  {r}")
+        # create_time 是 Python datetime 对象
+        if r.get("create_time"):
+            print(f"    create_time type: {type(r['create_time']).__name__}")
 
     rows = await User.select_by_map(db, {"age": 28})
     print(f"User.select_by_map(age=28): {rows}")
@@ -118,34 +122,10 @@ async def main():
     rows = await User.select_by_map(db, {"age": 22})
     print(f"Remaining age=22: {rows}")
 
-    # ============================================================
-    # 完整 CRUD 组合
-    # ============================================================
-    print("\n--- Article CRUD ---")
-
-    # 批量插入文章
-    await Article.insert_batch(db, [
-        {"title": "Rbatis Intro", "user_id": 1},
-        {"title": "Async Rust", "user_id": 2},
-        {"title": "PyO3 Guide", "user_id": 3},
-    ])
-
-    # 查询某用户的文章
-    rows = await Article.select_by_map(db, {"user_id": 1})
-    print(f"Articles by user 1: {rows}")
-
-    # 更新
-    await Article.update_by_map(
-        db,
-        {"title": "Rbatis Guide"},
-        {"title": "Rbatis Intro"},
-    )
-
-    # 查询全部
-    rows = await db.exec_decode("SELECT * FROM article")
-    print(f"All articles ({len(rows)}):")
+    rows = await db.exec_decode("SELECT * FROM user")
+    print(f"\nAll users ({len(rows)}):")
     for r in rows:
-        print(f"  {r}")
+        print(f"  id={r['id']} name={r['name']} age={r['age']} create_time={r.get('create_time')}")
 
     db.close()
     print(f"\nDone. Connected: {db.is_connected()}")
