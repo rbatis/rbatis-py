@@ -1,0 +1,23 @@
+[package]
+name = "rbatis-py"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for rbatis ORM - high-performance async ORM for Python"
+
+[lib]
+name = "rbatis_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
+rbatis = { version = "4" }
+rbdc-sqlite = { version = "4" }
+rbdc-mysql = { version = "4" }
+rbdc-pg = { version = "4" }
+rbdc-mssql = { version = "4" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rbs = { version = "4" }
+anyhow = "1"
+log = "0.4"
