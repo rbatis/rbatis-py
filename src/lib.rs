@@ -814,30 +814,120 @@ impl RbatisPy {
         })
     }
 
-    // ---------- Transactions ----------
+    // ---------- Connection / Transaction ----------
 
-    /// Begin a new transaction (sync acquisition, Transaction methods are async).
-    pub fn begin<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, TransactionPy>> {
+    /// Acquire a raw connection from the pool.
+    /// Returns a `Connection` object with `exec()`, `exec_decode()`, `begin()`, and `close()`.
+    ///
+    /// Usage:
+    /// ```python
+    /// conn = await db.acquire()
+    /// rows = await conn.exec_decode("SELECT * FROM user")
+    /// await conn.close()
+    /// ```
+    pub fn acquire<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let rb = self.rb.clone();
-        let tx = self.runtime.block_on(async move {
-            rb.acquire_begin()
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("Begin transaction failed: {}", e)))
-        })?;
-        let tx_id = tx.tx_id;
-        *self.tx.lock().unwrap() = Some(tx);
         let handle = self.runtime.handle().clone();
-        Bound::new(py, TransactionPy {
-            tx_id,
+        spawn_async(py, &self.runtime.handle(), async move {
+            let conn_executor = rb
+                .acquire()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Acquire failed: {}", e)))?;
+            let py_conn = ConnectionPy {
+                inner: Arc::new(Mutex::new(Some(conn_executor))),
+                handle: handle.clone(),
+            };
+            Python::with_gil(|py| {
+                Bound::new(py, py_conn).map(|b| b.unbind().into_any())
+            })
+        })
+    }
+
+    /// Explicit transaction: acquire a transaction and return a `Transaction` object.
+    /// The caller is responsible for calling `await tx.commit()` or `await tx.rollback()`.
+    ///
+    /// Usage:
+    /// ```python
+    /// tx = await db.begin()
+    /// await tx.exec("INSERT ...")
+    /// await tx.commit()
+    /// ```
+    pub fn begin<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        let rb = self.rb.clone();
+        let tx_arc = self.tx.clone();
+        let handle = self.runtime.handle().clone();
+        spawn_async(py, &self.runtime.handle(), async move {
+            let tx = rb
+                .acquire_begin()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Begin transaction failed: {}", e)))?;
+            let tx_id = tx.tx_id;
+            *tx_arc.lock().unwrap() = Some(tx);
+            let tx_clone = tx_arc.clone();
+            let handle_clone = handle.clone();
+            // Return a Transaction object (unbounded, Send)
+            Python::with_gil(|py| {
+                let tx_obj = Bound::new(py, TransactionPy {
+                    tx_id,
+                    tx: tx_clone,
+                    handle: handle_clone,
+                })?;
+                Ok(tx_obj.unbind().into_any())
+            })
+        })
+    }
+
+    /// Auto transaction (context manager): enter via `async with db.begin_defer():`.
+    /// Automatically commits on success, rolls back on exception.
+    ///
+    /// Usage:
+    /// ```python
+    /// async with db.begin_defer():
+    ///     await db.exec("INSERT ...")
+    ///     # auto commit or rollback
+    /// ```
+    pub fn begin_defer<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, DeferredTransactionPy>> {
+        Bound::new(py, DeferredTransactionPy {
             tx: self.tx.clone(),
-            handle,
+            rb: self.rb.clone(),
+            handle: self.runtime.handle().clone(),
+        })
+    }
+
+    /// Commit the active transaction (if any) on this DB instance.
+    pub fn commit<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        let tx_arc = self.tx.clone();
+        spawn_async(py, &self.runtime.handle(), async move {
+            let inner = tx_arc.lock().unwrap().take();
+            if let Some(t) = inner {
+                t.commit().await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Commit failed: {}", e)))?;
+                Ok(())
+            } else {
+                Err(PyRuntimeError::new_err("No active transaction"))
+            }
+        })
+    }
+
+    /// Rollback the active transaction (if any) on this DB instance.
+    pub fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        let tx_arc = self.tx.clone();
+        spawn_async(py, &self.runtime.handle(), async move {
+            let inner = tx_arc.lock().unwrap().take();
+            if let Some(t) = inner {
+                t.rollback().await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Rollback failed: {}", e)))?;
+                Ok(())
+            } else {
+                Err(PyRuntimeError::new_err("No active transaction"))
+            }
         })
     }
 
 }
 
 // ============================================================
-//  Transaction Python Class
+//  Transaction (Explicit) Python Class
 // ============================================================
 
 #[pyclass(name = "Transaction")]
@@ -862,11 +952,67 @@ impl TransactionPy {
         self.tx_id
     }
 
-    pub fn commit<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let tx = self.tx.clone();
+    /// Execute SQL (INSERT/UPDATE/DELETE) within this transaction.
+    #[pyo3(signature = (sql, params=None))]
+    pub fn exec<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let args = collect_params(params)?;
+        let sql = sql.to_string();
+        let tx_arc = self.tx.clone();
         let handle = self.handle.clone();
         spawn_async(py, &handle, async move {
-            let inner = tx.lock().unwrap().take();
+            let tx = {
+                let guard = tx_arc.lock().unwrap();
+                guard.as_ref()
+                    .ok_or_else(|| PyRuntimeError::new_err("Transaction already committed or rolled back"))?
+                    .clone()
+            };
+            let r = tx
+                .exec(&sql, args)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("SQL exec failed: {}", e)))?;
+            Ok(r.rows_affected as i64)
+        })
+    }
+
+    /// Query within this transaction. Returns List[Dict].
+    #[pyo3(signature = (sql, params=None))]
+    pub fn exec_decode<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let args = collect_params(params)?;
+        let sql = sql.to_string();
+        let tx_arc = self.tx.clone();
+        let handle = self.handle.clone();
+        spawn_async(py, &handle, async move {
+            let tx = {
+                let guard = tx_arc.lock().unwrap();
+                guard.as_ref()
+                    .ok_or_else(|| PyRuntimeError::new_err("Transaction already committed or rolled back"))?
+                    .clone()
+            };
+            let rows: Vec<Value> = tx
+                .exec_decode(&sql, args)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("SQL query failed: {}", e)))?;
+            Python::with_gil(|py| {
+                value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any())
+            })
+        })
+    }
+
+    pub fn commit<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        let tx_arc = self.tx.clone();
+        let handle = self.handle.clone();
+        spawn_async(py, &handle, async move {
+            let inner = tx_arc.lock().unwrap().take();
             if let Some(t) = inner {
                 t.commit().await
                     .map_err(|e| PyRuntimeError::new_err(format!("Commit failed: {}", e)))?;
@@ -878,10 +1024,10 @@ impl TransactionPy {
     }
 
     pub fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let tx = self.tx.clone();
+        let tx_arc = self.tx.clone();
         let handle = self.handle.clone();
         spawn_async(py, &handle, async move {
-            let inner = tx.lock().unwrap().take();
+            let inner = tx_arc.lock().unwrap().take();
             if let Some(t) = inner {
                 t.rollback().await
                     .map_err(|e| PyRuntimeError::new_err(format!("Rollback failed: {}", e)))?;
@@ -891,15 +1037,46 @@ impl TransactionPy {
             }
         })
     }
+}
 
-    fn __aenter__<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        // __aenter__ must return an awaitable; we return one that immediately resolves to self
-        let cf = py.import_bound("concurrent.futures")?.call_method0("Future")?;
-        cf.call_method1("set_result", (slf,))?;
-        let aw = py.import_bound("asyncio")?.call_method1("wrap_future", (cf,))?;
-        Ok(aw.unbind())
+// ============================================================
+//  DeferredTransaction (Auto / Context Manager) Python Class
+// ============================================================
+
+#[pyclass(name = "DeferredTransaction")]
+pub struct DeferredTransactionPy {
+    tx: Arc<Mutex<Option<rbatis::RBatisTxExecutor>>>,
+    rb: RBatis,
+    handle: tokio::runtime::Handle,
+}
+
+#[pymethods]
+impl DeferredTransactionPy {
+    #[new]
+    fn new() -> Self {
+        DeferredTransactionPy {
+            tx: Arc::new(Mutex::new(None)),
+            rb: RBatis::new(),
+            handle: tokio::runtime::Handle::current(),
+        }
     }
 
+    /// Acquire the transaction and set it on the DB. Called when entering `async with`.
+    fn __aenter__<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        let tx_arc = slf.borrow().tx.clone();
+        let rb = slf.borrow().rb.clone();
+        let handle = slf.borrow().handle.clone();
+        spawn_async(py, &handle, async move {
+            let tx = rb
+                .acquire_begin()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Begin transaction failed: {}", e)))?;
+            *tx_arc.lock().unwrap() = Some(tx);
+            Ok(())
+        })
+    }
+
+    /// Auto-commit or auto-rollback on exit.
     #[pyo3(signature = (exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __aexit__<'py>(
         &self,
@@ -909,10 +1086,10 @@ impl TransactionPy {
         _exc_tb: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let has_err = exc_type.is_some();
-        let tx = self.tx.clone();
+        let tx_arc = self.tx.clone();
         let handle = self.handle.clone();
         spawn_async(py, &handle, async move {
-            let inner = tx.lock().unwrap().take();
+            let inner = tx_arc.lock().unwrap().take();
             if let Some(t) = inner {
                 if has_err {
                     let _ = t.rollback().await;
@@ -927,6 +1104,111 @@ impl TransactionPy {
 }
 
 // ============================================================
+//  Connection Python Class
+// ============================================================
+
+#[pyclass(name = "Connection")]
+pub struct ConnectionPy {
+    inner: Arc<Mutex<Option<rbatis::executor::RBatisConnExecutor>>>,
+    handle: tokio::runtime::Handle,
+}
+
+#[pymethods]
+impl ConnectionPy {
+    /// Execute SQL (INSERT/UPDATE/DELETE) on this connection.
+    #[pyo3(signature = (sql, params=None))]
+    pub fn exec<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let args = collect_params(params)?;
+        let sql = sql.to_string();
+        let inner = self.inner.clone();
+        let handle = self.handle.clone();
+        spawn_async(py, &handle, async move {
+            let conn_executor = {
+                let guard = inner.lock().unwrap();
+                guard.as_ref()
+                    .ok_or_else(|| PyRuntimeError::new_err("Connection closed"))?
+                    .clone()
+            };
+            let r = conn_executor
+                .exec(&sql, args)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("SQL exec failed: {}", e)))?;
+            Ok(r.rows_affected as i64)
+        })
+    }
+
+    /// Query on this connection. Returns List[Dict].
+    #[pyo3(signature = (sql, params=None))]
+    pub fn exec_decode<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let args = collect_params(params)?;
+        let sql = sql.to_string();
+        let inner = self.inner.clone();
+        let handle = self.handle.clone();
+        spawn_async(py, &handle, async move {
+            let conn_executor = {
+                let guard = inner.lock().unwrap();
+                guard.as_ref()
+                    .ok_or_else(|| PyRuntimeError::new_err("Connection closed"))?
+                    .clone()
+            };
+            let rows: Vec<Value> = conn_executor
+                .exec_decode(&sql, args)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("SQL query failed: {}", e)))?;
+            Python::with_gil(|py| {
+                value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any())
+            })
+        })
+    }
+
+    /// Begin a transaction on this connection.
+    /// Returns a `Transaction` object (explicit commit/rollback required).
+    pub fn begin<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        let inner = self.inner.clone();
+        let handle = self.handle.clone();
+        let handle2 = handle.clone();
+        spawn_async(py, &handle, async move {
+            let conn_executor = inner
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| PyRuntimeError::new_err("Connection closed"))?;
+            let tx = conn_executor
+                .begin()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Begin transaction failed: {}", e)))?;
+            let tx_id = tx.tx_id;
+            // Put the tx executor into a shared container so commit/rollback can take it back
+            let tx_container: Arc<Mutex<Option<rbatis::RBatisTxExecutor>>> =
+                Arc::new(Mutex::new(Some(tx)));
+            Python::with_gil(|py| {
+                let tx_obj = Bound::new(py, TransactionPy {
+                    tx_id,
+                    tx: tx_container,
+                    handle: handle2.clone(),
+                })?;
+                Ok(tx_obj.unbind().into_any())
+            })
+        })
+    }
+
+    /// Close / release this connection back to the pool.
+    pub fn close(&self) {
+        *self.inner.lock().unwrap() = None;
+    }
+}
+
+// ============================================================
 //  PyO3 Module
 // ============================================================
 
@@ -934,6 +1216,8 @@ impl TransactionPy {
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RbatisPy>()?;
     m.add_class::<TransactionPy>()?;
+    m.add_class::<DeferredTransactionPy>()?;
+    m.add_class::<ConnectionPy>()?;
     m.add("__version__", "0.1.0")?;
     Ok(())
 }

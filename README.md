@@ -33,8 +33,8 @@ async def main():
     for row in rows:
         print(row["name"], row["age"])
 
-    # Transaction
-    async with db.begin():
+    # Transaction (auto mode)
+    async with db.begin_defer():
         await db.exec("UPDATE user SET age = ? WHERE name = ?", [31, "Alice"])
 
 asyncio.run(main())
@@ -79,7 +79,11 @@ async def main():
 | `update_by_map(table, data, condition)` | Update by condition | `Model::update_by_map(&rb, &table, condition).await` |
 | `delete_by_map(table, condition)` | Delete by condition | `Model::delete_by_map(&rb, condition).await` |
 | `link(url)` | Connect to database | `rb.link(driver, url).await` |
-| `begin()` | Begin transaction | `rb.acquire_begin().await` |
+| `acquire()` | Acquire a raw connection from pool | `rb.acquire().await` |
+| `begin()` | Begin transaction (explicit, returns `Transaction`) | `rb.acquire_begin().await` |
+| `begin_defer()` | Begin transaction (auto context manager) | `rb.acquire_begin().await` |
+| `commit()` | Commit current active transaction | `tx.commit().await` |
+| `rollback()` | Rollback current active transaction | `tx.rollback().await` |
 | `ping()` | Test connection | `rb.exec("SELECT 1").await` |
 | `close()` | Close connection | — |
 | `set_pool_max_size(n)` | Set max connections in the pool | `pool.set_max_open_conns(n).await` |
@@ -90,10 +94,48 @@ async def main():
 
 ### Transaction
 
+Two transaction modes are supported:
+
+**A) Explicit (manual commit/rollback):**
+
 ```python
-async with db.begin():
-    await db.exec("INSERT ...")
+tx = await db.begin()
+try:
+    await tx.exec("INSERT INTO user (name) VALUES (?)", ["Alice"])
+    await tx.exec("INSERT INTO user (name) VALUES (?)", ["Bob"])
+    await tx.commit()
+except Exception:
+    await tx.rollback()
+    raise
+```
+
+**B) Auto (context manager):**
+
+```python
+async with db.begin_defer():
+    await db.exec("INSERT INTO user (name) VALUES (?)", ["Alice"])
     # auto-commit on success, auto-rollback on exception
+```
+
+### Connection
+
+Acquire a raw connection from the pool to run queries in isolation:
+
+```python
+conn = await db.acquire()
+try:
+    rows = await conn.exec_decode("SELECT * FROM user WHERE age > ?", [20])
+
+    # You can also begin a transaction on this specific connection
+    tx = await conn.begin()
+    try:
+        await tx.exec("INSERT INTO user (name) VALUES (?)", ["Alice"])
+        await tx.commit()
+    except Exception:
+        await tx.rollback()
+        raise
+finally:
+    await conn.close()  # return to pool
 ```
 
 ### Model
@@ -108,13 +150,24 @@ class User(Model):
     age: int | None = None
 ```
 
-Then use classmethods for CRUD:
+Then use classmethods for CRUD. The ``db`` parameter accepts **RBatis**, **Connection**, or **Transaction** — all support ``exec()`` / ``exec_decode()``:
 
 ```python
 await User.insert(db, {...})
 await User.select_by_map(db, {condition})
 await User.update_by_map(db, {set_data}, {condition})
 await User.delete_by_map(db, {condition})
+```
+
+For example, with a raw connection:
+
+```python
+conn = await db.acquire()
+try:
+    await User.insert(conn, {"name": "Alice"})
+    rows = await User.select_by_map(conn, {"name": "Alice"})
+finally:
+    conn.close()
 ```
 
 ## Type Conversion

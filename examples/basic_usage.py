@@ -67,30 +67,79 @@ async def main():
         print(f"  {r}")
 
     # ============================================================
-    # 4. 事务 — async with db.begin():
+    # 4. 事务 — 两种模式
     #    Rust: let tx = rb.acquire_begin().await?;
     # ============================================================
-    print("\n--- Transaction ---")
-    async with db.begin():
-        await db.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Charlie", 28])
-        await db.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Diana", 22])
-    print("Committed")
+
+    # --- 模式 A: 显式事务 (手动 commit/rollback) ---
+    #    用 await db.begin() 获取 Transaction，
+    #    然后自己调用 commit() 或 rollback()
+    print("\n--- Explicit Transaction (manual commit) ---")
+    tx = await db.begin()
+    try:
+        await tx.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Charlie", 28])
+        await tx.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Diana", 22])
+        await tx.commit()
+        print("Committed")
+    except Exception:
+        await tx.rollback()
+        raise
+
+    # 显式事务 — 出异常时手动 rollback
+    print("\n--- Explicit Transaction (manual rollback on error) ---")
+    tx = await db.begin()
+    try:
+        await tx.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Eve", 26])
+        raise RuntimeError("oops")
+    except RuntimeError:
+        await tx.rollback()
+        print("Rolled back (expected)")
+
+    # --- 模式 B: 自动事务 (context manager) ---
+    #    用 async with db.begin_defer():,
+    #    自动 commit 或 rollback
+    print("\n--- Auto Transaction (context manager) ---")
+    async with db.begin_defer():
+        await db.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Frank", 32])
+        await db.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Grace", 27])
+    print("Auto committed")
 
     # 异常时自动 rollback
     try:
-        async with db.begin():
-            await db.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Eve", 26])
-            raise RuntimeError("oops")
+        async with db.begin_defer():
+            await db.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Heidi", 29])
+            raise RuntimeError("oops2")
     except RuntimeError:
-        print("Rolled back (expected)")
+        print("Auto rolled back (expected)")
 
     rows = await db.exec_decode("SELECT * FROM user")
-    print(f"After tx ({len(rows)} rows)")
+    print(f"\nFinal rows ({len(rows)}):")
     for r in rows:
         print(f"  {r}")
 
     # ============================================================
-    # 5. ping / close
+    # 5. acquire — 从连接池获取连接对象
+    # ============================================================
+    print("\n--- Acquire Connection ---")
+    conn = await db.acquire()
+    try:
+        rows = await conn.exec_decode("SELECT * FROM user WHERE age > ?", [20])
+        print(f"Acquired conn, got {len(rows)} rows")
+
+        # 在连接上开启事务
+        tx = await conn.begin()
+        try:
+            await tx.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Ivy", 33])
+            await tx.commit()
+            print("Connection tx committed")
+        except Exception:
+            await tx.rollback()
+            raise
+    finally:
+        conn.close()
+
+    # ============================================================
+    # 6. ping / close
     # ============================================================
     ok = await db.ping()
     print(f"\nPing: {ok}")
