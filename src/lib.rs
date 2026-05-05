@@ -234,6 +234,18 @@ fn py_dict_to_columns_values(dict: &Bound<'_, PyDict>) -> PyResult<(Vec<String>,
 /// Value::String/Value::I64, losing type info.
 fn raw_to_ext(v: &Value) -> Value {
     match v {
+        // MySQL returns TEXT columns as Value::Binary
+        Value::Binary(bytes) => {
+            if let Ok(s) = String::from_utf8(bytes.clone()) {
+                let trimmed = s.trim_start();
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    if serde_json::from_str::<serde_json::Value>(&s).is_ok() {
+                        return Value::Ext("Json", Box::new(Value::String(s)));
+                    }
+                }
+            }
+            v.clone()
+        }
         Value::String(s) => {
             // Quick check: if it looks like JSON object/array, try JSON first
             let trimmed = s.trim_start();
