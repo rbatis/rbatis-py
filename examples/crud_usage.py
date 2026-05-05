@@ -94,6 +94,14 @@ async def main():
     await db.exec("DROP TABLE IF EXISTS app_user")
     await db.exec(create_table_sql(db_type))
 
+    # 配置连接池
+    await db.set_pool_max_size(20)       # 最大20个连接
+    await db.set_pool_max_idle(5)        # 最多保留5个空闲连接
+    await db.set_pool_connect_timeout(30) # 获取连接超时30秒
+    await db.set_pool_max_lifetime(3600)  # 连接最长使用1小时
+    state = await db.pool_state()
+    print(state)
+
     # ============================================================
     # insert — 插入各类型数据
     # ============================================================

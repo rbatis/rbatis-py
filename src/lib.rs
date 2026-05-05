@@ -7,6 +7,7 @@ use rbs::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::runtime::Runtime;
 
 // Helper: iterate over a ValueMap entries
@@ -450,6 +451,90 @@ impl RbatisPy {
 
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+
+    // ---------- Connection Pool Configuration ----------
+
+    /// Set the maximum number of connections the pool may establish.
+    pub fn set_pool_max_size<'py>(
+        &self,
+        py: Python<'py>,
+        max_size: u64,
+    ) -> PyResult<Py<PyAny>> {
+        let rb = self.rb.clone();
+        spawn_async(py, &self.runtime.handle(), async move {
+            let pool = rb
+                .get_pool()
+                .map_err(|e| PyRuntimeError::new_err(format!("Pool not initialized: {}", e)))?;
+            pool.set_max_open_conns(max_size).await;
+            Ok(())
+        })
+    }
+
+    /// Set the maximum idle connections kept in the pool.
+    pub fn set_pool_max_idle<'py>(
+        &self,
+        py: Python<'py>,
+        max_idle: u64,
+    ) -> PyResult<Py<PyAny>> {
+        let rb = self.rb.clone();
+        spawn_async(py, &self.runtime.handle(), async move {
+            let pool = rb
+                .get_pool()
+                .map_err(|e| PyRuntimeError::new_err(format!("Pool not initialized: {}", e)))?;
+            pool.set_max_idle_conns(max_idle).await;
+            Ok(())
+        })
+    }
+
+    /// Set the connection timeout in seconds (timeout waiting for a connection from the pool).
+    pub fn set_pool_connect_timeout<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_secs: u64,
+    ) -> PyResult<Py<PyAny>> {
+        let rb = self.rb.clone();
+        spawn_async(py, &self.runtime.handle(), async move {
+            let pool = rb
+                .get_pool()
+                .map_err(|e| PyRuntimeError::new_err(format!("Pool not initialized: {}", e)))?;
+            pool.set_timeout(Some(Duration::from_secs(timeout_secs)))
+                .await;
+            Ok(())
+        })
+    }
+
+    /// Set the maximum lifetime of a connection in seconds. Connections older
+    /// than this will be closed and replaced.
+    pub fn set_pool_max_lifetime<'py>(
+        &self,
+        py: Python<'py>,
+        lifetime_secs: u64,
+    ) -> PyResult<Py<PyAny>> {
+        let rb = self.rb.clone();
+        spawn_async(py, &self.runtime.handle(), async move {
+            let pool = rb
+                .get_pool()
+                .map_err(|e| PyRuntimeError::new_err(format!("Pool not initialized: {}", e)))?;
+            pool.set_conn_max_lifetime(Some(Duration::from_secs(lifetime_secs)))
+                .await;
+            Ok(())
+        })
+    }
+
+    /// Inspect pool state. Returns a dict with keys:
+    /// `max_open`, `connections`, `in_use`, `idle`, `waits`, `connecting`, `checking`.
+    pub fn pool_state<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        let rb = self.rb.clone();
+        spawn_async(py, &self.runtime.handle(), async move {
+            let pool = rb
+                .get_pool()
+                .map_err(|e| PyRuntimeError::new_err(format!("Pool not initialized: {}", e)))?;
+            let state = pool.state().await;
+            Ok(Python::with_gil(|py| {
+                rbs_to_py(&state, py).map(|v| v.unbind().into_any())
+            })?)
+        })
     }
 
     pub fn ping<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
