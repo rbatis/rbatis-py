@@ -1594,6 +1594,7 @@ dependencies = [
  "log",
  "pyo3",
  "rbatis",
+ "rbdc",
  "rbdc-mssql",
  "rbdc-mysql",
  "rbdc-pg",

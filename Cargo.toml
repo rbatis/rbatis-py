@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
 rbatis = { version = "4" }
+rbdc = { version = "4" }
 rbdc-sqlite = { version = "4" }
 rbdc-mysql = { version = "4" }
 rbdc-pg = { version = "4" }

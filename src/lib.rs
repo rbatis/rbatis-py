@@ -126,8 +126,8 @@ fn rbs_to_py<'py>(value: &Value, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>
         }
         Value::Ext("DateTime", inner) => {
             if let Value::String(s) = inner.as_ref() {
-                let m = py.import_bound("datetime")?;
-                let r = m.call_method1("datetime.fromisoformat", (s.clone(),))?;
+                let dt_cls = py.import_bound("datetime")?.getattr("datetime")?;
+                let r = dt_cls.call_method1("fromisoformat", (s.clone(),))?;
                 Ok(r.into_any())
             } else {
                 rbs_to_py(inner.as_ref(), py)
@@ -152,8 +152,8 @@ fn rbs_to_py<'py>(value: &Value, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>
         }
         Value::Ext("Time", inner) => {
             if let Value::String(s) = inner.as_ref() {
-                let m = py.import_bound("datetime")?;
-                let r = m.call_method1("time.fromisoformat", (s.clone(),))?;
+                let t_cls = py.import_bound("datetime")?.getattr("time")?;
+                let r = t_cls.call_method1("fromisoformat", (s.clone(),))?;
                 Ok(r.into_any())
             } else {
                 rbs_to_py(inner.as_ref(), py)
@@ -161,12 +161,30 @@ fn rbs_to_py<'py>(value: &Value, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>
         }
         Value::Ext("Timestamp", inner) => match inner.as_ref() {
             Value::I64(ts) => {
-                let m = py.import_bound("datetime")?;
-                let r = m.call_method1("datetime.fromtimestamp", (*ts as f64 / 1000.0,))?;
+                let dt_cls = py.import_bound("datetime")?.getattr("datetime")?;
+                let r = dt_cls.call_method1("fromtimestamp", (*ts as f64 / 1000.0,))?;
                 Ok(r.into_any())
             }
             _ => rbs_to_py(inner.as_ref(), py),
         },
+        Value::Ext("Decimal", inner) => {
+            if let Value::String(s) = inner.as_ref() {
+                let dec_cls = py.import_bound("decimal")?.getattr("Decimal")?;
+                let r = dec_cls.call1((s.clone(),))?;
+                Ok(r.into_any())
+            } else {
+                rbs_to_py(inner.as_ref(), py)
+            }
+        }
+        Value::Ext("Uuid", inner) => {
+            if let Value::String(s) = inner.as_ref() {
+                let uuid_cls = py.import_bound("uuid")?.getattr("UUID")?;
+                let r = uuid_cls.call1((s.clone(),))?;
+                Ok(r.into_any())
+            } else {
+                rbs_to_py(inner.as_ref(), py)
+            }
+        }
         Value::Ext(_tag, inner) => rbs_to_py(inner.as_ref(), py),
     }
 }
@@ -199,6 +217,46 @@ fn py_dict_to_columns_values(dict: &Bound<'_, PyDict>) -> PyResult<(Vec<String>,
     Ok((columns, values))
 }
 
+/// Try to convert a raw database value into an rbs Ext type.
+/// This mimics what rbatis's serde deserialization does when decoding
+/// into a typed struct (e.g. BizActivity with DateTime/Decimal/Uuid fields).
+///
+/// Without this, `exec_decode::<Vec<Value>>` skips serde and returns raw
+/// Value::String/Value::I64, losing type info.
+fn raw_to_ext(v: &Value) -> Value {
+    match v {
+        Value::String(_) => {
+            // Try each rbdc type in order. Deserialize impls handle Value::String.
+            if let Ok(dt) = rbs::from_value::<rbdc::types::datetime::DateTime>(v.clone()) {
+                return Value::Ext("DateTime", Box::new(Value::String(dt.to_string())));
+            }
+            if let Ok(d) = rbs::from_value::<rbdc::types::date::Date>(v.clone()) {
+                return Value::Ext("Date", Box::new(Value::String(d.to_string())));
+            }
+            if let Ok(t) = rbs::from_value::<rbdc::types::time::Time>(v.clone()) {
+                return Value::Ext("Time", Box::new(Value::String(t.to_string())));
+            }
+            if let Ok(d) = rbs::from_value::<rbdc::types::decimal::Decimal>(v.clone()) {
+                return Value::Ext("Decimal", Box::new(Value::String(d.to_string())));
+            }
+            if let Ok(u) = rbs::from_value::<rbdc::types::uuid::Uuid>(v.clone()) {
+                // rbdc::Uuid::deserialize accepts ANY string without validation,
+                // so we must verify the format before wrapping.
+                if u.0.len() == 36 {
+                    let bytes = u.0.as_bytes();
+                    if bytes[8] == b'-' && bytes[13] == b'-' && bytes[18] == b'-' && bytes[23] == b'-'
+                        && bytes.iter().all(|&c| c == b'-' || c.is_ascii_hexdigit())
+                    {
+                        return Value::Ext("Uuid", Box::new(Value::String(u.0)));
+                    }
+                }
+            }
+            v.clone()
+        }
+        _ => v.clone(),
+    }
+}
+
 fn value_vec_to_pylist<'py>(vec: &[Value], py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
     let list = PyList::empty_bound(py);
     for row in vec {
@@ -209,11 +267,13 @@ fn value_vec_to_pylist<'py>(vec: &[Value], py: Python<'py>) -> PyResult<Bound<'p
                     Value::String(s) => s.clone(),
                     o => format!("{:?}", o),
                 };
-                d.set_item(ks, rbs_to_py(v, py)?)?;
+                let converted = raw_to_ext(v);
+                d.set_item(ks, rbs_to_py(&converted, py)?)?;
             }
             list.append(d.into_any())?;
         } else {
-            list.append(rbs_to_py(row, py)?)?;
+            let converted = raw_to_ext(row);
+            list.append(rbs_to_py(&converted, py)?)?;
         }
     }
     Ok(list)
