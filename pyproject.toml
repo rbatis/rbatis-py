@@ -21,6 +21,11 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 
+[project.urls]
+Homepage = "https://github.com/rbatis/rbatis-py"
+Source = "https://github.com/rbatis/rbatis-py"
+Issues = "https://github.com/rbatis/rbatis-py/issues"
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"
