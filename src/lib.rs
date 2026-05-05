@@ -185,6 +185,15 @@ fn rbs_to_py<'py>(value: &Value, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>
                 rbs_to_py(inner.as_ref(), py)
             }
         }
+        Value::Ext("Json", inner) => {
+            if let Value::String(s) = inner.as_ref() {
+                let json_mod = py.import_bound("json")?;
+                let r = json_mod.call_method1("loads", (s.clone(),))?;
+                Ok(r.into_any())
+            } else {
+                rbs_to_py(inner.as_ref(), py)
+            }
+        }
         Value::Ext(_tag, inner) => rbs_to_py(inner.as_ref(), py),
     }
 }
@@ -225,7 +234,14 @@ fn py_dict_to_columns_values(dict: &Bound<'_, PyDict>) -> PyResult<(Vec<String>,
 /// Value::String/Value::I64, losing type info.
 fn raw_to_ext(v: &Value) -> Value {
     match v {
-        Value::String(_) => {
+        Value::String(s) => {
+            // Quick check: if it looks like JSON object/array, try JSON first
+            let trimmed = s.trim_start();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                if serde_json::from_str::<serde_json::Value>(s).is_ok() {
+                    return Value::Ext("Json", Box::new(Value::String(s.clone())));
+                }
+            }
             // Try each rbdc type in order. Deserialize impls handle Value::String.
             if let Ok(dt) = rbs::from_value::<rbdc::types::datetime::DateTime>(v.clone()) {
                 return Value::Ext("DateTime", Box::new(Value::String(dt.to_string())));
