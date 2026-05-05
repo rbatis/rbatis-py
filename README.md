@@ -82,6 +82,11 @@ async def main():
 | `begin()` | Begin transaction | `rb.acquire_begin().await` |
 | `ping()` | Test connection | `rb.exec("SELECT 1").await` |
 | `close()` | Close connection | — |
+| `set_pool_max_size(n)` | Set max connections in the pool | `pool.set_max_open_conns(n).await` |
+| `set_pool_max_idle(n)` | Set max idle connections in the pool | `pool.set_max_idle_conns(n).await` |
+| `set_pool_connect_timeout(s)` | Set connection timeout (seconds) | `pool.set_timeout(dur).await` |
+| `set_pool_max_lifetime(s)` | Set max connection lifetime (seconds) | `pool.set_conn_max_lifetime(dur).await` |
+| `pool_state()` | Inspect pool state (returns dict) | `pool.state().await` |
 
 ### Transaction
 
@@ -142,6 +147,25 @@ await db.link("postgres://user:pass@localhost:5432/db")
 
 # MSSQL
 await db.link("jdbc:sqlserver://localhost:1433;User=SA;Password=xxx;Database=db")
+```
+
+## Connection Pool
+
+Configure the connection pool after calling `link()`. These methods must be called **after** a connection is established.
+
+```python
+await db.link("mysql://user:pass@localhost:3306/mydb")
+
+# Configure pool
+await db.set_pool_max_size(20)          # Max 20 connections
+await db.set_pool_max_idle(5)           # Keep at most 5 idle connections
+await db.set_pool_connect_timeout(30)   # Timeout waiting for a connection (seconds)
+await db.set_pool_max_lifetime(3600)    # Max connection lifetime (seconds)
+
+# Inspect pool state
+state = await db.pool_state()
+print(state)
+# e.g. {"max_open": 20, "connections": 3, "in_use": 1, "idle": 2, "waits": 0, ...}
 ```
 
 ## Development
