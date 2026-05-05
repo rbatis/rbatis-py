@@ -7,6 +7,7 @@ Supports **SQLite**, **MySQL**, **PostgreSQL**, and **MSSQL**.
 ## Installation
 
 ```bash
+# https://pypi.org/project/rbatis-py/
 pip install rbatis-py
 ```
 
