@@ -1,16 +1,16 @@
-"""示例2: CRUD 用法 — 定义表结构体 + 内置 CRUD 函数
+"""Example 2: CRUD usage — define a table model + built-in CRUD functions
 
-对应 Rust rbatis 的 ``crud!`` 宏：
+Corresponds to Rust rbatis ``crud!`` macro:
 
     struct BizActivity { id, name, age, create_time, salary, user_uuid }
     crud!(BizActivity {});
 
-用法:
+Usage:
     uv run python examples/crud_usage.py sqlite
     uv run python examples/crud_usage.py mysql
     uv run python examples/crud_usage.py postgres
 
-类型转换:
+Type conversions:
     Python datetime.datetime  <->  rbs Ext("DateTime")  <->  rbdc::DateTime
     Python decimal.Decimal    <->  rbs Ext("Decimal")    <->  rbdc::Decimal
     Python uuid.UUID          <->  rbs Ext("Uuid")       <->  rbdc::Uuid
@@ -33,7 +33,7 @@ DEFAULT_DB = "sqlite"
 
 
 class AppUser(Model):
-    """用户表"""
+    """User table model"""
     __table__ = "app_user"
     id: int | None = None
     name: str | None = None
@@ -90,20 +90,20 @@ async def main():
     await db.link(url)
     print(f"[{db_type}] Connected: {db.is_connected()}")
 
-    # 建表
+    # Create table
     await db.exec("DROP TABLE IF EXISTS app_user")
     await db.exec(create_table_sql(db_type))
 
-    # 配置连接池
-    await db.set_pool_max_size(20)       # 最大20个连接
-    await db.set_pool_max_idle(5)        # 最多保留5个空闲连接
-    await db.set_pool_connect_timeout(30) # 获取连接超时30秒
-    await db.set_pool_max_lifetime(3600)  # 连接最长使用1小时
+    # Configure connection pool
+    await db.set_pool_max_size(20)          # Max 20 connections
+    await db.set_pool_max_idle(5)           # Keep at most 5 idle connections
+    await db.set_pool_connect_timeout(30)   # Timeout waiting for a connection (seconds)
+    await db.set_pool_max_lifetime(3600)    # Max connection lifetime (seconds)
     state = await db.pool_state()
     print(state)
 
     # ============================================================
-    # insert — 插入各类型数据
+    # insert — insert various data types
     # ============================================================
     now = datetime.now()
     uid = str(uuid4())
@@ -120,7 +120,7 @@ async def main():
     print(f"  user_uuid:   {uid} ({type(uid).__name__})")
 
     # ============================================================
-    # select_by_map — 查询并检查类型
+    # select_by_map — query and inspect types
     # ============================================================
     rows = await AppUser.select_by_map(db, {"name": "Alice"})
     print(f"\nselect_by_map(name='Alice'):")
@@ -139,7 +139,7 @@ async def main():
     print(f"\ninsert_batch: {affected} row(s)")
 
     # ============================================================
-    # exec_decode — 原生 SQL 查询
+    # exec_decode — raw SQL query
     # ============================================================
     rows = await db.exec_decode("SELECT * FROM user")
     print(f"\nexec_decode ({len(rows)} rows):")

@@ -1,11 +1,11 @@
-"""示例1: 基础用法 — exec, exec_decode, 事务
+"""Example 1: Basic usage — exec, exec_decode, transactions
 
-对应 rbatis Rust API:
+Corresponds to rbatis Rust API:
     rb.exec(sql, args).await?;
     let rows: Vec<Value> = rb.exec_decode(sql, args).await?;
     let tx = rb.acquire_begin().await?;
 
-运行:
+Run:
     cd rbatis-py/
     uv run python examples/basic_usage.py
 """
@@ -18,13 +18,13 @@ DB_URL = "sqlite://target/rbatis_example.db"
 
 async def main():
     # ============================================================
-    # 1. 连接数据库
+    # 1. Connect to database
     # ============================================================
     db = RBatis()
     await db.link(DB_URL)
     print(f"Connected: {db.is_connected()}")
 
-    # 建表
+    # Create table
     await db.exec("DROP TABLE IF EXISTS user")
     await db.exec(
         "CREATE TABLE IF NOT EXISTS user ("
@@ -35,7 +35,7 @@ async def main():
     )
 
     # ============================================================
-    # 2. exec — 执行 INSERT/UPDATE/DELETE
+    # 2. exec — execute INSERT/UPDATE/DELETE
     #    Rust: rb.exec(sql, args).await?
     # ============================================================
     affected = await db.exec(
@@ -53,7 +53,7 @@ async def main():
     print(f"UPDATE: {affected} row(s)")
 
     # ============================================================
-    # 3. exec_decode — 查询返回 List[Dict]
+    # 3. exec_decode — query returns List[Dict]
     #    Rust: let rows: Vec<Value> = rb.exec_decode(sql, args).await?
     # ============================================================
     rows = await db.exec_decode("SELECT * FROM user")
@@ -67,13 +67,13 @@ async def main():
         print(f"  {r}")
 
     # ============================================================
-    # 4. 事务 — 两种模式
+    # 4. Transactions — two modes
     #    Rust: let tx = rb.acquire_begin().await?;
     # ============================================================
 
-    # --- 模式 A: 显式事务 (手动 commit/rollback) ---
-    #    用 await db.begin() 获取 Transaction，
-    #    然后自己调用 commit() 或 rollback()
+    # --- Mode A: Explicit transaction (manual commit/rollback) ---
+    #     Use await db.begin() to get a Transaction,
+    #     then call commit() or rollback() yourself
     print("\n--- Explicit Transaction (manual commit) ---")
     tx = await db.begin()
     try:
@@ -85,7 +85,7 @@ async def main():
         await tx.rollback()
         raise
 
-    # 显式事务 — 出异常时手动 rollback
+    # Explicit transaction — manual rollback on error
     print("\n--- Explicit Transaction (manual rollback on error) ---")
     tx = await db.begin()
     try:
@@ -95,16 +95,16 @@ async def main():
         await tx.rollback()
         print("Rolled back (expected)")
 
-    # --- 模式 B: 自动事务 (context manager) ---
-    #    用 async with db.begin_defer():,
-    #    自动 commit 或 rollback
+    # --- Mode B: Auto transaction (context manager) ---
+    #     Use async with db.begin_defer():,
+    #     auto commit or rollback
     print("\n--- Auto Transaction (context manager) ---")
     async with db.begin_defer():
         await db.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Frank", 32])
         await db.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Grace", 27])
     print("Auto committed")
 
-    # 异常时自动 rollback
+    # Auto rollback on exception
     try:
         async with db.begin_defer():
             await db.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Heidi", 29])
@@ -118,7 +118,7 @@ async def main():
         print(f"  {r}")
 
     # ============================================================
-    # 5. acquire — 从连接池获取连接对象
+    # 5. acquire — get a connection from the pool
     # ============================================================
     print("\n--- Acquire Connection ---")
     conn = await db.acquire()
@@ -126,7 +126,7 @@ async def main():
         rows = await conn.exec_decode("SELECT * FROM user WHERE age > ?", [20])
         print(f"Acquired conn, got {len(rows)} rows")
 
-        # 在连接上开启事务
+        # Begin a transaction on this connection
         tx = await conn.begin()
         try:
             await tx.exec("INSERT INTO user (name, age) VALUES (?, ?)", ["Ivy", 33])
