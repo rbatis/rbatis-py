@@ -2,8 +2,14 @@
 
 对应 Rust rbatis 的 ``crud!`` 宏：
 
-    struct BizActivity { id, name, create_time }
+    struct BizActivity { id, name, age, create_time }
     crud!(BizActivity {});
+
+类型转换（py_to_rbs / rbs_to_py 自动处理）:
+    Python datetime.datetime  <->  rbs Value::Ext("DateTime", ...)  <->  rbdc::DateTime
+    Python datetime.date      <->  rbs Value::Ext("Date", ...)      <->  rbdc::Date
+    Python decimal.Decimal    <->  rbs Value::Ext("Decimal", ...)   <->  rbdc::Decimal
+    Python uuid.UUID          <->  rbs Value::Ext("Uuid", ...)      <->  rbdc::Uuid
 
 在 Python 中，继承 ``Model`` 并定义 ``__table__`` 即可。
 
@@ -13,7 +19,7 @@
 """
 
 import asyncio
-from datetime import datetime as dt
+from datetime import datetime
 from rbatis_py import RBatis, Model
 
 DB_URL = "sqlite://target/rbatis_crud.db"
@@ -27,12 +33,11 @@ DB_URL = "sqlite://target/rbatis_crud.db"
 #   struct User { id: Option<i64>, name: Option<String>, age: Option<i32>, create_time: Option<DateTime> }
 #   crud!(User {});
 #
-# Python 版:
-#   字段类型标注仅用于提示，rbdc 类型会与 Python 原生类型自动转换:
-#     rbdc::DateTime  <->  datetime.datetime
-#     rbdc::Date      <->  datetime.date
-#     rbdc::Decimal   <->  decimal.Decimal
-#     rbdc::Uuid      <->  uuid.UUID
+# Python 类型         rbs 序列化             数据库类型
+#   datetime.datetime  -->  Ext("DateTime", ...)  -->  rbdc::DateTime
+#   datetime.date      -->  Ext("Date", ...)       -->  rbdc::Date
+#   decimal.Decimal    -->  Ext("Decimal", ...)    -->  rbdc::Decimal
+#   uuid.UUID          -->  Ext("Uuid", ...)       -->  rbdc::Uuid
 # ============================================================
 class User(Model):
     """用户表"""
@@ -40,7 +45,8 @@ class User(Model):
     id: int | None = None
     name: str | None = None
     age: int | None = None
-    create_time: dt | None = None
+    # Python datetime.datetime  <->  rbs Ext("DateTime")  <->  rbdc::DateTime
+    create_time: datetime | None = None
 
 
 async def main():
@@ -59,43 +65,31 @@ async def main():
     )
 
     # ============================================================
-    # insert — 插入单条（Python datetime 自动转 rbdc::DateTime）
+    # insert — 插入单条（Python datetime -> rbs Ext("DateTime") -> rbdc::DateTime）
     # ============================================================
-    affected = await User.insert(db, {
-        "name": "Alice",
-        "age": 30,
-        "create_time": dt.now(),
-    })
+    now = datetime.now()
+    affected = await User.insert(db, {"name": "Alice", "age": 30, "create_time": now})
     print(f"User.insert: {affected} row(s)")
 
-    affected = await User.insert(db, {
-        "name": "Bob",
-        "age": 25,
-        "create_time": dt.now(),
-    })
+    affected = await User.insert(db, {"name": "Bob", "age": 25, "create_time": now})
     print(f"User.insert: {affected} row(s)")
 
     # ============================================================
     # insert_batch — 批量插入
     # ============================================================
     users = [
-        {"name": "Charlie", "age": 35, "create_time": dt.now()},
-        {"name": "David", "age": 28, "create_time": dt.now()},
-        {"name": "Eve", "age": 22, "create_time": dt.now()},
+        {"name": "Charlie", "age": 35, "create_time": now},
+        {"name": "David", "age": 28, "create_time": now},
+        {"name": "Eve", "age": 22, "create_time": now},
     ]
     affected = await User.insert_batch(db, users)
     print(f"\nUser.insert_batch ({len(users)} items): {affected} row(s)")
 
     # ============================================================
-    # select_by_map — 条件查询（datetime 自动转回 Python datetime）
+    # select_by_map — 条件查询
     # ============================================================
     rows = await User.select_by_map(db, {"name": "Alice"})
-    print(f"\nUser.select_by_map(name='Alice'):")
-    for r in rows:
-        print(f"  {r}")
-        # create_time 是 Python datetime 对象
-        if r.get("create_time"):
-            print(f"    create_time type: {type(r['create_time']).__name__}")
+    print(f"\nUser.select_by_map(name='Alice'): {rows}")
 
     rows = await User.select_by_map(db, {"age": 28})
     print(f"User.select_by_map(age=28): {rows}")
@@ -125,7 +119,7 @@ async def main():
     rows = await db.exec_decode("SELECT * FROM user")
     print(f"\nAll users ({len(rows)}):")
     for r in rows:
-        print(f"  id={r['id']} name={r['name']} age={r['age']} create_time={r.get('create_time')}")
+        print(f"  {r}")
 
     db.close()
     print(f"\nDone. Connected: {db.is_connected()}")
