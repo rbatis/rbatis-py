@@ -61,7 +61,7 @@ async def main():
     await User.insert_batch(db, [
         {"name": "Bob", "age": 25},
         {"name": "Charlie", "age": 35},
-    ])
+    ], batch_size=1000)
     rows = await User.select_by_map(db, {"name": "Alice"})
     affected = await User.update_by_map(db, {"age": 31}, {"name": "Alice"})
     affected = await User.delete_by_map(db, {"name": "Bob"})
@@ -76,7 +76,7 @@ async def main():
 | `exec(sql, params)` | Execute INSERT/UPDATE/DELETE |
 | `exec_decode(sql, params)` | Query returns `List[Dict]` |
 | `insert(table, data)` | Insert one row |
-| `insert_batch(table, data_list)` | Batch insert |
+| `insert_batch(table, data_list, batch_size=None)` | Batch insert (chunked by batch_size) |
 | `select_by_map(table, condition)` | Select by condition |
 | `update_by_map(table, data, condition)` | Update by condition |
 | `delete_by_map(table, condition)` | Delete by condition |

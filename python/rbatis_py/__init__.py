@@ -71,8 +71,8 @@ class Model:
         return await db.exec(sql, list(data.values()))
 
     @classmethod
-    async def insert_batch(cls, db: RBatis, data_list: List[Dict[str, Any]]) -> int:
-        """Batch insert records. Returns rows affected."""
+    async def insert_batch(cls, db: RBatis, data_list: List[Dict[str, Any]], batch_size: int = 10) -> int:
+        """Batch insert records with chunking. Returns rows affected."""
         if not data_list:
             return 0
         # Collect all column names (preserve insertion order)
@@ -85,17 +85,20 @@ class Model:
                     seen.add(k)
         cols_str = ",".join(columns)
 
-        groups = []
-        all_vals = []
-        for d in data_list:
-            row_placeholders = []
-            for c in columns:
-                all_vals.append(d.get(c))
-                row_placeholders.append("?")
-            groups.append("({})".format(",".join(row_placeholders)))
-
-        sql = "INSERT INTO {} ({}) VALUES {}".format(cls.__table__, cols_str, ",".join(groups))
-        return await db.exec(sql, all_vals)
+        total = 0
+        for i in range(0, len(data_list), batch_size):
+            chunk = data_list[i:i + batch_size]
+            groups = []
+            all_vals = []
+            for d in chunk:
+                row_placeholders = []
+                for c in columns:
+                    all_vals.append(d.get(c))
+                    row_placeholders.append("?")
+                groups.append("({})".format(",".join(row_placeholders)))
+            sql = "INSERT INTO {} ({}) VALUES {}".format(cls.__table__, cols_str, ",".join(groups))
+            total += await db.exec(sql, all_vals)
+        return total
 
     @classmethod
     async def select_by_map(

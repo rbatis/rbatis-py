@@ -135,7 +135,7 @@ async def main():
         {"name": "Bob", "age": 25, "create_time": now, "salary": Decimal("999.99"), "user_uuid": str(uuid4())},
         {"name": "Charlie", "age": 35, "create_time": now, "salary": Decimal("50000"), "user_uuid": str(uuid4())},
     ]
-    affected = await AppUser.insert_batch(db, users)
+    affected = await AppUser.insert_batch(db, users, batch_size=10)
     print(f"\ninsert_batch: {affected} row(s)")
 
     # ============================================================

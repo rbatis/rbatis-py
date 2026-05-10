@@ -726,12 +726,13 @@ impl RbatisPy {
         })
     }
 
-    #[pyo3(signature = (table, data))]
+    #[pyo3(signature = (table, data, batch_size=None))]
     pub fn insert_batch<'py>(
         &self,
         py: Python<'py>,
         table: &str,
         data: &Bound<'_, PyList>,
+        batch_size: Option<usize>,
     ) -> PyResult<Py<PyAny>> {
         if data.is_empty() {
             return spawn_async(py, &self.runtime.handle(), async move { Ok(0i64) });
@@ -760,27 +761,8 @@ impl RbatisPy {
         }
         let cols_str = columns.join(",");
 
-        let mut all_vals = Vec::new();
-        let mut groups = Vec::new();
-        for (cols, vals) in &rows {
-            let mut rv = Vec::new();
-            for c in &columns {
-                if let Some(p) = cols.iter().position(|x| x == c) {
-                    all_vals.push(vals[p].clone());
-                } else {
-                    all_vals.push(Value::Null);
-                }
-                rv.push("?".to_string());
-            }
-            groups.push(format!("({})", rv.join(",")));
-        }
-
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES {}",
-            table,
-            cols_str,
-            groups.join(",")
-        );
+        let chunk_size = batch_size.unwrap_or(rows.len());
+        let table = table.to_string();
         let pool = self.pool.clone();
         let tx_arc = self.tx_conn.clone();
         spawn_async(py, &self.runtime.handle(), async move {
@@ -788,13 +770,45 @@ impl RbatisPy {
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
                 .clone();
-            if let Some(conn_arc) = tx_conn_opt {
-                let mut conn = conn_arc.lock().await;
-                return exec_on_conn(&mut *conn, &sql, all_vals).await;
+
+            let mut total = 0i64;
+            for chunk in rows.chunks(chunk_size) {
+                let mut all_vals = Vec::new();
+                let mut groups = Vec::new();
+                for (cols, vals) in chunk {
+                    let mut rv = Vec::new();
+                    for c in &columns {
+                        if let Some(p) = cols.iter().position(|x| x == c) {
+                            all_vals.push(vals[p].clone());
+                        } else {
+                            all_vals.push(Value::Null);
+                        }
+                        rv.push("?".to_string());
+                    }
+                    groups.push(format!("({})", rv.join(",")));
+                }
+
+                let sql = format!(
+                    "INSERT INTO {} ({}) VALUES {}",
+                    table,
+                    cols_str,
+                    groups.join(",")
+                );
+
+                let affected = match tx_conn_opt.as_ref() {
+                    Some(conn_arc) => {
+                        let mut conn = conn_arc.lock().await;
+                        exec_on_conn(&mut *conn, &sql, all_vals).await?
+                    }
+                    None => {
+                        let p = get_pool(&pool)?;
+                        let mut conn = acquire_conn(p).await?;
+                        exec_on_conn(&mut conn, &sql, all_vals).await?
+                    }
+                };
+                total += affected;
             }
-            let p = get_pool(&pool)?;
-            let mut conn = acquire_conn(p).await?;
-            exec_on_conn(&mut conn, &sql, all_vals).await
+            Ok(total)
         })
     }
 
