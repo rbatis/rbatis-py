@@ -222,39 +222,6 @@ print(state)
 # e.g. {"max_open": 20, "connections": 3, "in_use": 1, "idle": 2, "waits": 0, ...}
 ```
 
-## Development
-
-```bash
-git clone https://github.com/rbatis/rbatis-py.git
-cd rbatis-py
-pip install maturin
-maturin develop  # build and install in current venv
-```
-
-### Running examples
-
-```bash
-uv run python examples/raw_sql.py     # exec, exec_decode, transactions
-uv run python examples/crud.py      # Model CRUD
-uv run python examples/crud.py mysql     # with MySQL
-uv run python examples/crud.py postgres  # with PostgreSQL
-```
-
-## Publishing to PyPI
-
-```bash
-# Install maturin if not already installed
-pip install maturin
-
-# Build wheel
-maturin build
-
-# Publish to PyPI (requires PyPI account and API token)
-maturin publish
-
-# Or use the official GitHub Action:
-# https://github.com/PyO3/maturin-action
-```
 
 ## License
 
