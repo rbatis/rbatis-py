@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 
 class RBatis:
-    """High-performance async ORM client, backed by rbatis (Rust)."""
+    """High-performance async database client."""
 
     def __init__(self) -> None: ...
 

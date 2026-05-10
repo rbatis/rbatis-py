@@ -1,16 +1,20 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use rbatis::RBatis;
-use rbdc_turso::TursoDriver;
-use rbdc_duckdb::DuckDbDriver;
 use rbs::value::map::ValueMap;
 use rbs::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex as AsyncMutex;
+
+use rbdc::db::Connection;
+use rbdc::pool::{ConnectionManager, Pool};
+use rbdc_pool_fast::FastPool;
 
 // Helper: iterate over a ValueMap entries
 fn value_map_iter(map: &rbs::value::map::ValueMap) -> impl Iterator<Item = (&Value, &Value)> {
@@ -233,7 +237,7 @@ fn py_dict_to_columns_values(dict: &Bound<'_, PyDict>) -> PyResult<(Vec<String>,
 /// This mimics what rbatis's serde deserialization does when decoding
 /// into a typed struct (e.g. BizActivity with DateTime/Decimal/Uuid fields).
 ///
-/// Without this, `exec_decode::<Vec<Value>>` skips serde and returns raw
+/// Without this, `exec_decode` skips serde and returns raw
 /// Value::String/Value::I64, losing type info.
 fn raw_to_ext(v: &Value) -> Value {
     match v {
@@ -320,14 +324,11 @@ where
     F: Future<Output = PyResult<R>> + Send + 'static,
     R: IntoPy<Py<PyAny>> + Send + 'static,
 {
-    // Create a concurrent.futures.Future (thread-safe, can be resolved from any thread)
     let cf_mod = py.import_bound("concurrent.futures")?;
     let cf: Bound<'_, PyAny> = cf_mod.call_method0("Future")?;
 
-    // Clone for the spawned task
     let cf_clone: Py<PyAny> = cf.clone().unbind();
 
-    // Spawn work on tokio runtime
     handle.spawn(async move {
         let result = work.await;
         Python::with_gil(|py| {
@@ -344,22 +345,66 @@ where
         });
     });
 
-    // Wrap concurrent.futures.Future into an asyncio-compatible awaitable
     let asyncio = py.import_bound("asyncio")?;
     let awaitable = asyncio.call_method1("wrap_future", (cf,))?;
     Ok(awaitable.unbind())
 }
 
+/// Execute SQL on a connection, return rows affected.
+async fn exec_on_conn(
+    conn: &mut Box<dyn Connection>,
+    sql: &str,
+    args: Vec<Value>,
+) -> Result<i64, PyErr> {
+    let r = conn
+        .exec(sql, args)
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("SQL exec failed: {}", e)))?;
+    Ok(r.rows_affected as i64)
+}
+
+/// Execute query on a connection, return Vec<Value> (row maps).
+async fn query_on_conn(
+    conn: &mut Box<dyn Connection>,
+    sql: &str,
+    args: Vec<Value>,
+) -> Result<Vec<Value>, PyErr> {
+    let v = conn
+        .exec_decode(sql, args)
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("SQL query failed: {}", e)))?;
+    match v {
+        Value::Array(rows) => Ok(rows),
+        other => Ok(vec![other]),
+    }
+}
+
+/// Get pool from OnceLock, return &dyn Pool or PyErr.
+fn get_pool(pool: &OnceLock<Box<dyn Pool>>) -> Result<&dyn Pool, PyErr> {
+    pool.get()
+        .map(|p| p.as_ref())
+        .ok_or_else(|| PyRuntimeError::new_err("Pool not initialized"))
+}
+
+/// Acquire a connection from the pool.
+async fn acquire_conn(pool: &dyn Pool) -> Result<Box<dyn Connection>, PyErr> {
+    pool.get()
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("Acquire connection failed: {}", e)))
+}
+
 // ============================================================
-//  Rbatis Python Class
+//  RBatis Python Class
 // ============================================================
 
 #[pyclass(name = "RBatis")]
 pub struct RbatisPy {
-    rb: RBatis,
+    pool: Arc<OnceLock<Box<dyn Pool>>>,
     runtime: Runtime,
     connected: Arc<AtomicBool>,
-    tx: Arc<Mutex<Option<rbatis::RBatisTxExecutor>>>,
+    /// Active transaction connection (if any).
+    /// Inner tokio::sync::Mutex allows async locking for SQL operations.
+    tx_conn: Arc<Mutex<Option<Arc<AsyncMutex<Box<dyn Connection>>>>>>,
 }
 
 #[pymethods]
@@ -369,92 +414,122 @@ impl RbatisPy {
         let runtime =
             Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("Runtime: {}", e)))?;
         Ok(RbatisPy {
-            rb: RBatis::new(),
+            pool: Arc::new(OnceLock::new()),
             runtime,
             connected: Arc::new(AtomicBool::new(false)),
-            tx: Arc::new(Mutex::new(None)),
+            tx_conn: Arc::new(Mutex::new(None)),
         })
     }
 
     // ---------- Connection ----------
 
-    pub fn link_sqlite<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+    fn link_sqlite<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
+        let pool = self.pool.clone();
         let connected = self.connected.clone();
         let url = url.to_string();
         spawn_async(py, &self.runtime.handle(), async move {
-            rb.link(rbdc_sqlite::driver::SqliteDriver {}, &url)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("SQLite connect failed: {}", e)))?;
+            let manager = ConnectionManager::new(rbdc_sqlite::driver::SqliteDriver {}, &url)
+                .map_err(|e| PyRuntimeError::new_err(format!("SQLite init error: {}", e)))?;
+            let fast_pool =
+                FastPool::new(manager)
+                    .map_err(|e| PyRuntimeError::new_err(format!(
+                        "SQLite pool create failed: {}",
+                        e
+                    )))?;
+            // Test connection
+            let _conn = acquire_conn(&fast_pool).await?;
+            pool.set(Box::new(fast_pool))
+                .map_err(|_| PyRuntimeError::new_err("Pool already initialized"))?;
             connected.store(true, Ordering::Relaxed);
             Ok(())
         })
     }
 
-    pub fn link_mysql<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+    fn link_mysql<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
+        let pool = self.pool.clone();
         let connected = self.connected.clone();
         let url = url.to_string();
         spawn_async(py, &self.runtime.handle(), async move {
-            rb.link(rbdc_mysql::driver::MysqlDriver {}, &url)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("MySQL connect failed: {}", e)))?;
+            let manager = ConnectionManager::new(rbdc_mysql::driver::MysqlDriver {}, &url)
+                .map_err(|e| PyRuntimeError::new_err(format!("MySQL init error: {}", e)))?;
+            let fast_pool = FastPool::new(manager).map_err(|e| {
+                PyRuntimeError::new_err(format!("MySQL pool create failed: {}", e))
+            })?;
+            let _conn = acquire_conn(&fast_pool).await?;
+            pool.set(Box::new(fast_pool))
+                .map_err(|_| PyRuntimeError::new_err("Pool already initialized"))?;
             connected.store(true, Ordering::Relaxed);
             Ok(())
         })
     }
 
-    pub fn link_postgres<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+    fn link_postgres<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
+        let pool = self.pool.clone();
         let connected = self.connected.clone();
         let url = url.to_string();
         spawn_async(py, &self.runtime.handle(), async move {
-            rb.link(rbdc_pg::driver::PgDriver {}, &url)
-                .await
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("PostgreSQL connect failed: {}", e))
-                })?;
+            let manager = ConnectionManager::new(rbdc_pg::driver::PgDriver {}, &url)
+                .map_err(|e| PyRuntimeError::new_err(format!("PostgreSQL init error: {}", e)))?;
+            let fast_pool = FastPool::new(manager).map_err(|e| {
+                PyRuntimeError::new_err(format!("PostgreSQL pool create failed: {}", e))
+            })?;
+            let _conn = acquire_conn(&fast_pool).await?;
+            pool.set(Box::new(fast_pool))
+                .map_err(|_| PyRuntimeError::new_err("Pool already initialized"))?;
             connected.store(true, Ordering::Relaxed);
             Ok(())
         })
     }
 
-    pub fn link_mssql<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+    fn link_mssql<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
+        let pool = self.pool.clone();
         let connected = self.connected.clone();
         let url = url.to_string();
         spawn_async(py, &self.runtime.handle(), async move {
-            rb.link(rbdc_mssql::driver::MssqlDriver {}, &url)
-                .await
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("MSSQL connect failed: {}", e))
-                })?;
+            let manager = ConnectionManager::new(rbdc_mssql::driver::MssqlDriver {}, &url)
+                .map_err(|e| PyRuntimeError::new_err(format!("MSSQL init error: {}", e)))?;
+            let fast_pool = FastPool::new(manager).map_err(|e| {
+                PyRuntimeError::new_err(format!("MSSQL pool create failed: {}", e))
+            })?;
+            let _conn = acquire_conn(&fast_pool).await?;
+            pool.set(Box::new(fast_pool))
+                .map_err(|_| PyRuntimeError::new_err("Pool already initialized"))?;
             connected.store(true, Ordering::Relaxed);
             Ok(())
         })
     }
 
-    pub fn link_turso<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+    fn link_turso<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
+        let pool = self.pool.clone();
         let connected = self.connected.clone();
         let url = url.to_string();
         spawn_async(py, &self.runtime.handle(), async move {
-            rb.link(TursoDriver {}, &url)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("Turso connect failed: {}", e)))?;
+            let manager = ConnectionManager::new(rbdc_turso::TursoDriver {}, &url)
+                .map_err(|e| PyRuntimeError::new_err(format!("Turso init error: {}", e)))?;
+            let fast_pool = FastPool::new(manager).map_err(|e| {
+                PyRuntimeError::new_err(format!("Turso pool create failed: {}", e))
+            })?;
+            let _conn = acquire_conn(&fast_pool).await?;
+            pool.set(Box::new(fast_pool))
+                .map_err(|_| PyRuntimeError::new_err("Pool already initialized"))?;
             connected.store(true, Ordering::Relaxed);
             Ok(())
         })
     }
 
-    pub fn link_duckdb<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+    fn link_duckdb<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
+        let pool = self.pool.clone();
         let connected = self.connected.clone();
         let url = url.to_string();
         spawn_async(py, &self.runtime.handle(), async move {
-            rb.link(DuckDbDriver {}, &url)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("DuckDB connect failed: {}", e)))?;
+            let manager = ConnectionManager::new(rbdc_duckdb::DuckDbDriver {}, &url)
+                .map_err(|e| PyRuntimeError::new_err(format!("DuckDB init error: {}", e)))?;
+            let fast_pool = FastPool::new(manager).map_err(|e| {
+                PyRuntimeError::new_err(format!("DuckDB pool create failed: {}", e))
+            })?;
+            let _conn = acquire_conn(&fast_pool).await?;
+            pool.set(Box::new(fast_pool))
+                .map_err(|_| PyRuntimeError::new_err("Pool already initialized"))?;
             connected.store(true, Ordering::Relaxed);
             Ok(())
         })
@@ -487,82 +562,56 @@ impl RbatisPy {
 
     // ---------- Connection Pool Configuration ----------
 
-    /// Set the maximum number of connections the pool may establish.
-    pub fn set_pool_max_size<'py>(
-        &self,
-        py: Python<'py>,
-        max_size: u64,
-    ) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+    pub fn set_pool_max_size<'py>(&self, py: Python<'py>, max_size: u64) -> PyResult<Py<PyAny>> {
+        let pool = self.pool.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let pool = rb
-                .get_pool()
-                .map_err(|e| PyRuntimeError::new_err(format!("Pool not initialized: {}", e)))?;
-            pool.set_max_open_conns(max_size).await;
+            let p = get_pool(&pool)?;
+            p.set_max_open_conns(max_size).await;
             Ok(())
         })
     }
 
-    /// Set the maximum idle connections kept in the pool.
-    pub fn set_pool_max_idle<'py>(
-        &self,
-        py: Python<'py>,
-        max_idle: u64,
-    ) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+    pub fn set_pool_max_idle<'py>(&self, py: Python<'py>, max_idle: u64) -> PyResult<Py<PyAny>> {
+        let pool = self.pool.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let pool = rb
-                .get_pool()
-                .map_err(|e| PyRuntimeError::new_err(format!("Pool not initialized: {}", e)))?;
-            pool.set_max_idle_conns(max_idle).await;
+            let p = get_pool(&pool)?;
+            p.set_max_idle_conns(max_idle).await;
             Ok(())
         })
     }
 
-    /// Set the connection timeout in seconds (timeout waiting for a connection from the pool).
     pub fn set_pool_connect_timeout<'py>(
         &self,
         py: Python<'py>,
         timeout_secs: u64,
     ) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+        let pool = self.pool.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let pool = rb
-                .get_pool()
-                .map_err(|e| PyRuntimeError::new_err(format!("Pool not initialized: {}", e)))?;
-            pool.set_timeout(Some(Duration::from_secs(timeout_secs)))
-                .await;
+            let p = get_pool(&pool)?;
+            p.set_timeout(Some(Duration::from_secs(timeout_secs))).await;
             Ok(())
         })
     }
 
-    /// Set the maximum lifetime of a connection in seconds. Connections older
-    /// than this will be closed and replaced.
     pub fn set_pool_max_lifetime<'py>(
         &self,
         py: Python<'py>,
         lifetime_secs: u64,
     ) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+        let pool = self.pool.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let pool = rb
-                .get_pool()
-                .map_err(|e| PyRuntimeError::new_err(format!("Pool not initialized: {}", e)))?;
-            pool.set_conn_max_lifetime(Some(Duration::from_secs(lifetime_secs)))
+            let p = get_pool(&pool)?;
+            p.set_conn_max_lifetime(Some(Duration::from_secs(lifetime_secs)))
                 .await;
             Ok(())
         })
     }
 
-    /// Inspect pool state. Returns a dict with keys:
-    /// `max_open`, `connections`, `in_use`, `idle`, `waits`, `connecting`, `checking`.
     pub fn pool_state<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+        let pool = self.pool.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let pool = rb
-                .get_pool()
-                .map_err(|e| PyRuntimeError::new_err(format!("Pool not initialized: {}", e)))?;
-            let state = pool.state().await;
+            let p = get_pool(&pool)?;
+            let state = p.state().await;
             Ok(Python::with_gil(|py| {
                 rbs_to_py(&state, py).map(|v| v.unbind().into_any())
             })?)
@@ -570,9 +619,11 @@ impl RbatisPy {
     }
 
     pub fn ping<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+        let pool = self.pool.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            rb.exec("SELECT 1", vec![])
+            let p = get_pool(&pool)?;
+            let mut conn = acquire_conn(p).await?;
+            conn.ping()
                 .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Ping failed: {}", e)))?;
             Ok(true)
@@ -594,23 +645,21 @@ impl RbatisPy {
     ) -> PyResult<Py<PyAny>> {
         let args = collect_params(params)?;
         let sql = sql.to_string();
-        let rb = self.rb.clone();
-        let tx_arc = self.tx.clone();
+        let pool = self.pool.clone();
+        let tx_arc = self.tx_conn.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let maybe_tx = tx_arc.lock().unwrap().clone();
-            if let Some(tx) = maybe_tx {
-                let r = tx
-                    .exec(&sql, args)
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("SQL exec failed: {}", e)))?;
-                Ok(r.rows_affected as i64)
-            } else {
-                let r = rb
-                    .exec(&sql, args)
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(format!("SQL exec failed: {}", e)))?;
-                Ok(r.rows_affected as i64)
+            // Active transaction: use its connection
+            let tx_conn_opt = tx_arc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .clone();
+            if let Some(conn_arc) = tx_conn_opt {
+                let mut conn = conn_arc.lock().await;
+                return exec_on_conn(&mut *conn, &sql, args).await;
             }
+            let p = get_pool(&pool)?;
+            let mut conn = acquire_conn(p).await?;
+            exec_on_conn(&mut conn, &sql, args).await
         })
     }
 
@@ -623,20 +672,20 @@ impl RbatisPy {
     ) -> PyResult<Py<PyAny>> {
         let args = collect_params(params)?;
         let sql = sql.to_string();
-        let rb = self.rb.clone();
-        let tx_arc = self.tx.clone();
+        let pool = self.pool.clone();
+        let tx_arc = self.tx_conn.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let rows: Vec<Value> = {
-                let maybe_tx = tx_arc.lock().unwrap().clone();
-                if let Some(tx) = maybe_tx {
-                    tx.exec_decode(&sql, args).await.map_err(|e| {
-                        PyRuntimeError::new_err(format!("SQL query failed: {}", e))
-                    })?
-                } else {
-                    rb.exec_decode(&sql, args).await.map_err(|e| {
-                        PyRuntimeError::new_err(format!("SQL query failed: {}", e))
-                    })?
-                }
+            let tx_conn_opt = tx_arc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .clone();
+            let rows = if let Some(conn_arc) = tx_conn_opt {
+                let mut conn = conn_arc.lock().await;
+                query_on_conn(&mut *conn, &sql, args).await?
+            } else {
+                let p = get_pool(&pool)?;
+                let mut conn = acquire_conn(p).await?;
+                query_on_conn(&mut conn, &sql, args).await?
             };
             Python::with_gil(|py| {
                 value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any())
@@ -660,21 +709,20 @@ impl RbatisPy {
         let cols = columns.join(",");
         let ph = columns.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!("INSERT INTO {} ({}) VALUES ({})", table, cols, ph);
-        let rb = self.rb.clone();
-        let tx_arc = self.tx.clone();
+        let pool = self.pool.clone();
+        let tx_arc = self.tx_conn.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let maybe_tx = tx_arc.lock().unwrap().clone();
-            if let Some(tx) = maybe_tx {
-                let r = tx.exec(&sql, values).await.map_err(|e| {
-                    PyRuntimeError::new_err(format!("Insert failed: {}", e))
-                })?;
-                Ok(r.rows_affected as i64)
-            } else {
-                let r = rb.exec(&sql, values).await.map_err(|e| {
-                    PyRuntimeError::new_err(format!("Insert failed: {}", e))
-                })?;
-                Ok(r.rows_affected as i64)
+            let tx_conn_opt = tx_arc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .clone();
+            if let Some(conn_arc) = tx_conn_opt {
+                let mut conn = conn_arc.lock().await;
+                return exec_on_conn(&mut *conn, &sql, values).await;
             }
+            let p = get_pool(&pool)?;
+            let mut conn = acquire_conn(p).await?;
+            exec_on_conn(&mut conn, &sql, values).await
         })
     }
 
@@ -727,22 +775,26 @@ impl RbatisPy {
             groups.push(format!("({})", rv.join(",")));
         }
 
-        let sql = format!("INSERT INTO {} ({}) VALUES {}", table, cols_str, groups.join(","));
-        let rb = self.rb.clone();
-        let tx_arc = self.tx.clone();
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES {}",
+            table,
+            cols_str,
+            groups.join(",")
+        );
+        let pool = self.pool.clone();
+        let tx_arc = self.tx_conn.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let maybe_tx = tx_arc.lock().unwrap().clone();
-            if let Some(tx) = maybe_tx {
-                let r = tx.exec(&sql, all_vals).await.map_err(|e| {
-                    PyRuntimeError::new_err(format!("Batch insert failed: {}", e))
-                })?;
-                Ok(r.rows_affected as i64)
-            } else {
-                let r = rb.exec(&sql, all_vals).await.map_err(|e| {
-                    PyRuntimeError::new_err(format!("Batch insert failed: {}", e))
-                })?;
-                Ok(r.rows_affected as i64)
+            let tx_conn_opt = tx_arc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .clone();
+            if let Some(conn_arc) = tx_conn_opt {
+                let mut conn = conn_arc.lock().await;
+                return exec_on_conn(&mut *conn, &sql, all_vals).await;
             }
+            let p = get_pool(&pool)?;
+            let mut conn = acquire_conn(p).await?;
+            exec_on_conn(&mut conn, &sql, all_vals).await
         })
     }
 
@@ -759,25 +811,32 @@ impl RbatisPy {
         if sc.is_empty() || wc.is_empty() {
             return Err(PyValueError::new_err("update_by_map needs data + condition"));
         }
-        let set = sc.iter().map(|c| format!("{} = ?", c)).collect::<Vec<_>>().join(",");
-        let wh = wc.iter().map(|c| format!("{} = ?", c)).collect::<Vec<_>>().join(" AND ");
+        let set = sc
+            .iter()
+            .map(|c| format!("{} = ?", c))
+            .collect::<Vec<_>>()
+            .join(",");
+        let wh = wc
+            .iter()
+            .map(|c| format!("{} = ?", c))
+            .collect::<Vec<_>>()
+            .join(" AND ");
         let sql = format!("UPDATE {} SET {} WHERE {}", table, set, wh);
         sv.extend(wv);
-        let rb = self.rb.clone();
-        let tx_arc = self.tx.clone();
+        let pool = self.pool.clone();
+        let tx_arc = self.tx_conn.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let maybe_tx = tx_arc.lock().unwrap().clone();
-            if let Some(tx) = maybe_tx {
-                let r = tx.exec(&sql, sv).await.map_err(|e| {
-                    PyRuntimeError::new_err(format!("Update failed: {}", e))
-                })?;
-                Ok(r.rows_affected as i64)
-            } else {
-                let r = rb.exec(&sql, sv).await.map_err(|e| {
-                    PyRuntimeError::new_err(format!("Update failed: {}", e))
-                })?;
-                Ok(r.rows_affected as i64)
+            let tx_conn_opt = tx_arc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .clone();
+            if let Some(conn_arc) = tx_conn_opt {
+                let mut conn = conn_arc.lock().await;
+                return exec_on_conn(&mut *conn, &sql, sv).await;
             }
+            let p = get_pool(&pool)?;
+            let mut conn = acquire_conn(p).await?;
+            exec_on_conn(&mut conn, &sql, sv).await
         })
     }
 
@@ -792,22 +851,26 @@ impl RbatisPy {
         if wc.is_empty() {
             return Err(PyValueError::new_err("select_by_map needs condition dict"));
         }
-        let wh = wc.iter().map(|c| format!("{} = ?", c)).collect::<Vec<_>>().join(" AND ");
+        let wh = wc
+            .iter()
+            .map(|c| format!("{} = ?", c))
+            .collect::<Vec<_>>()
+            .join(" AND ");
         let sql = format!("SELECT * FROM {} WHERE {}", table, wh);
-        let rb = self.rb.clone();
-        let tx_arc = self.tx.clone();
+        let pool = self.pool.clone();
+        let tx_arc = self.tx_conn.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let rows: Vec<Value> = {
-                let maybe_tx = tx_arc.lock().unwrap().clone();
-                if let Some(tx) = maybe_tx {
-                    tx.exec_decode(&sql, wv).await.map_err(|e| {
-                        PyRuntimeError::new_err(format!("Select failed: {}", e))
-                    })?
-                } else {
-                    rb.exec_decode(&sql, wv).await.map_err(|e| {
-                        PyRuntimeError::new_err(format!("Select failed: {}", e))
-                    })?
-                }
+            let tx_conn_opt = tx_arc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .clone();
+            let rows = if let Some(conn_arc) = tx_conn_opt {
+                let mut conn = conn_arc.lock().await;
+                query_on_conn(&mut *conn, &sql, wv).await?
+            } else {
+                let p = get_pool(&pool)?;
+                let mut conn = acquire_conn(p).await?;
+                query_on_conn(&mut conn, &sql, wv).await?
             };
             Python::with_gil(|py| {
                 value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any())
@@ -826,113 +889,97 @@ impl RbatisPy {
         if wc.is_empty() {
             return Err(PyValueError::new_err("delete_by_map needs condition dict"));
         }
-        let wh = wc.iter().map(|c| format!("{} = ?", c)).collect::<Vec<_>>().join(" AND ");
+        let wh = wc
+            .iter()
+            .map(|c| format!("{} = ?", c))
+            .collect::<Vec<_>>()
+            .join(" AND ");
         let sql = format!("DELETE FROM {} WHERE {}", table, wh);
-        let rb = self.rb.clone();
-        let tx_arc = self.tx.clone();
+        let pool = self.pool.clone();
+        let tx_arc = self.tx_conn.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let maybe_tx = tx_arc.lock().unwrap().clone();
-            if let Some(tx) = maybe_tx {
-                let r = tx.exec(&sql, wv).await.map_err(|e| {
-                    PyRuntimeError::new_err(format!("Delete failed: {}", e))
-                })?;
-                Ok(r.rows_affected as i64)
-            } else {
-                let r = rb.exec(&sql, wv).await.map_err(|e| {
-                    PyRuntimeError::new_err(format!("Delete failed: {}", e))
-                })?;
-                Ok(r.rows_affected as i64)
+            let tx_conn_opt = tx_arc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .clone();
+            if let Some(conn_arc) = tx_conn_opt {
+                let mut conn = conn_arc.lock().await;
+                return exec_on_conn(&mut *conn, &sql, wv).await;
             }
+            let p = get_pool(&pool)?;
+            let mut conn = acquire_conn(p).await?;
+            exec_on_conn(&mut conn, &sql, wv).await
         })
     }
 
     // ---------- Connection / Transaction ----------
 
-    /// Acquire a raw connection from the pool.
-    /// Returns a `Connection` object with `exec()`, `exec_decode()`, `begin()`, and `close()`.
-    ///
-    /// Usage:
-    /// ```python
-    /// conn = await db.acquire()
-    /// rows = await conn.exec_decode("SELECT * FROM user")
-    /// await conn.close()
-    /// ```
     pub fn acquire<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
+        let pool = self.pool.clone();
         let handle = self.runtime.handle().clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let conn_executor = rb
-                .acquire()
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("Acquire failed: {}", e)))?;
+            let p = get_pool(&pool)?;
+            let conn = acquire_conn(p).await?;
             let py_conn = ConnectionPy {
-                inner: Arc::new(Mutex::new(Some(conn_executor))),
+                inner: Arc::new(AsyncMutex::new(Some(conn))),
                 handle: handle.clone(),
             };
-            Python::with_gil(|py| {
-                Bound::new(py, py_conn).map(|b| b.unbind().into_any())
-            })
+            Python::with_gil(|py| Bound::new(py, py_conn).map(|b| b.unbind().into_any()))
         })
     }
 
-    /// Explicit transaction: acquire a transaction and return a `Transaction` object.
-    /// The caller is responsible for calling `await tx.commit()` or `await tx.rollback()`.
-    ///
-    /// Usage:
-    /// ```python
-    /// tx = await db.begin()
-    /// await tx.exec("INSERT ...")
-    /// await tx.commit()
-    /// ```
     pub fn begin<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let rb = self.rb.clone();
-        let tx_arc = self.tx.clone();
+        let pool = self.pool.clone();
+        let tx_arc = self.tx_conn.clone();
         let handle = self.runtime.handle().clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let tx = rb
-                .acquire_begin()
+            let p = get_pool(&pool)?;
+            let mut conn = acquire_conn(p).await?;
+            conn.begin()
                 .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Begin transaction failed: {}", e)))?;
-            let tx_id = tx.tx_id;
-            *tx_arc.lock().unwrap() = Some(tx);
+            let conn_arc = Arc::new(AsyncMutex::new(conn));
+            *tx_arc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))? = Some(conn_arc.clone());
             let tx_clone = tx_arc.clone();
             let handle_clone = handle.clone();
-            // Return a Transaction object (unbounded, Send)
             Python::with_gil(|py| {
-                let tx_obj = Bound::new(py, TransactionPy {
-                    tx_id,
-                    tx: tx_clone,
-                    handle: handle_clone,
-                })?;
+                let tx_obj = Bound::new(
+                    py,
+                    TransactionPy {
+                        conn: conn_arc.clone(),
+                        tx_outer: tx_clone,
+                        handle: handle_clone,
+                    },
+                )?;
                 Ok(tx_obj.unbind().into_any())
             })
         })
     }
 
-    /// Auto transaction (context manager): enter via `async with db.begin_defer():`.
-    /// Automatically commits on success, rolls back on exception.
-    ///
-    /// Usage:
-    /// ```python
-    /// async with db.begin_defer():
-    ///     await db.exec("INSERT ...")
-    ///     # auto commit or rollback
-    /// ```
     pub fn begin_defer<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, DeferredTransactionPy>> {
-        Bound::new(py, DeferredTransactionPy {
-            tx: self.tx.clone(),
-            rb: self.rb.clone(),
-            handle: self.runtime.handle().clone(),
-        })
+        Bound::new(
+            py,
+            DeferredTransactionPy {
+                tx: self.tx_conn.clone(),
+                pool: self.pool.clone(),
+                handle: self.runtime.handle().clone(),
+            },
+        )
     }
 
-    /// Commit the active transaction (if any) on this DB instance.
     pub fn commit<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let tx_arc = self.tx.clone();
+        let tx_arc = self.tx_conn.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let inner = tx_arc.lock().unwrap().take();
-            if let Some(t) = inner {
-                t.commit().await
+            let conn = tx_arc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .take();
+            if let Some(conn_arc) = conn {
+                let mut conn = conn_arc.lock().await;
+                conn.commit()
+                    .await
                     .map_err(|e| PyRuntimeError::new_err(format!("Commit failed: {}", e)))?;
                 Ok(())
             } else {
@@ -941,13 +988,17 @@ impl RbatisPy {
         })
     }
 
-    /// Rollback the active transaction (if any) on this DB instance.
     pub fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let tx_arc = self.tx.clone();
+        let tx_arc = self.tx_conn.clone();
         spawn_async(py, &self.runtime.handle(), async move {
-            let inner = tx_arc.lock().unwrap().take();
-            if let Some(t) = inner {
-                t.rollback().await
+            let conn = tx_arc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .take();
+            if let Some(conn_arc) = conn {
+                let mut conn = conn_arc.lock().await;
+                conn.rollback()
+                    .await
                     .map_err(|e| PyRuntimeError::new_err(format!("Rollback failed: {}", e)))?;
                 Ok(())
             } else {
@@ -955,36 +1006,25 @@ impl RbatisPy {
             }
         })
     }
-
 }
 
 // ============================================================
 //  Transaction (Explicit) Python Class
 // ============================================================
 
+/// Transaction class — only created from Rust (via `begin()`).
+/// Python users cannot construct this directly.
 #[pyclass(name = "Transaction")]
 pub struct TransactionPy {
-    tx_id: i64,
-    tx: Arc<Mutex<Option<rbatis::RBatisTxExecutor>>>,
+    conn: Arc<AsyncMutex<Box<dyn Connection>>>,
+    /// Shared reference to RbatisPy's tx_conn, so commit/rollback
+    /// also clears the outer transaction reference.
+    tx_outer: Arc<Mutex<Option<Arc<AsyncMutex<Box<dyn Connection>>>>>>,
     handle: tokio::runtime::Handle,
 }
 
 #[pymethods]
 impl TransactionPy {
-    #[new]
-    fn new() -> Self {
-        TransactionPy {
-            tx_id: 0,
-            tx: Arc::new(Mutex::new(None)),
-            handle: tokio::runtime::Handle::current(),
-        }
-    }
-
-    fn get_tx_id(&self) -> i64 {
-        self.tx_id
-    }
-
-    /// Execute SQL (INSERT/UPDATE/DELETE) within this transaction.
     #[pyo3(signature = (sql, params=None))]
     pub fn exec<'py>(
         &self,
@@ -994,24 +1034,14 @@ impl TransactionPy {
     ) -> PyResult<Py<PyAny>> {
         let args = collect_params(params)?;
         let sql = sql.to_string();
-        let tx_arc = self.tx.clone();
+        let conn = self.conn.clone();
         let handle = self.handle.clone();
         spawn_async(py, &handle, async move {
-            let tx = {
-                let guard = tx_arc.lock().unwrap();
-                guard.as_ref()
-                    .ok_or_else(|| PyRuntimeError::new_err("Transaction already committed or rolled back"))?
-                    .clone()
-            };
-            let r = tx
-                .exec(&sql, args)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("SQL exec failed: {}", e)))?;
-            Ok(r.rows_affected as i64)
+            let mut guard = conn.lock().await;
+            exec_on_conn(&mut *guard, &sql, args).await
         })
     }
 
-    /// Query within this transaction. Returns List[Dict].
     #[pyo3(signature = (sql, params=None))]
     pub fn exec_decode<'py>(
         &self,
@@ -1021,19 +1051,11 @@ impl TransactionPy {
     ) -> PyResult<Py<PyAny>> {
         let args = collect_params(params)?;
         let sql = sql.to_string();
-        let tx_arc = self.tx.clone();
+        let conn = self.conn.clone();
         let handle = self.handle.clone();
         spawn_async(py, &handle, async move {
-            let tx = {
-                let guard = tx_arc.lock().unwrap();
-                guard.as_ref()
-                    .ok_or_else(|| PyRuntimeError::new_err("Transaction already committed or rolled back"))?
-                    .clone()
-            };
-            let rows: Vec<Value> = tx
-                .exec_decode(&sql, args)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("SQL query failed: {}", e)))?;
+            let mut guard = conn.lock().await;
+            let rows = query_on_conn(&mut *guard, &sql, args).await?;
             Python::with_gil(|py| {
                 value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any())
             })
@@ -1041,32 +1063,38 @@ impl TransactionPy {
     }
 
     pub fn commit<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let tx_arc = self.tx.clone();
+        let conn = self.conn.clone();
+        let tx_outer = self.tx_outer.clone();
         let handle = self.handle.clone();
         spawn_async(py, &handle, async move {
-            let inner = tx_arc.lock().unwrap().take();
-            if let Some(t) = inner {
-                t.commit().await
-                    .map_err(|e| PyRuntimeError::new_err(format!("Commit failed: {}", e)))?;
-                Ok(())
-            } else {
-                Err(PyRuntimeError::new_err("No active transaction"))
-            }
+            let _outer = tx_outer
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .take();
+            let mut guard = conn.lock().await;
+            guard
+                .commit()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Commit failed: {}", e)))?;
+            Ok(())
         })
     }
 
     pub fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let tx_arc = self.tx.clone();
+        let conn = self.conn.clone();
+        let tx_outer = self.tx_outer.clone();
         let handle = self.handle.clone();
         spawn_async(py, &handle, async move {
-            let inner = tx_arc.lock().unwrap().take();
-            if let Some(t) = inner {
-                t.rollback().await
-                    .map_err(|e| PyRuntimeError::new_err(format!("Rollback failed: {}", e)))?;
-                Ok(())
-            } else {
-                Err(PyRuntimeError::new_err("No active transaction"))
-            }
+            let _outer = tx_outer
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .take();
+            let mut guard = conn.lock().await;
+            guard
+                .rollback()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Rollback failed: {}", e)))?;
+            Ok(())
         })
     }
 }
@@ -1075,40 +1103,34 @@ impl TransactionPy {
 //  DeferredTransaction (Auto / Context Manager) Python Class
 // ============================================================
 
+/// DeferredTransaction — only created via `begin_defer()`.
+/// Python users cannot construct this directly.
 #[pyclass(name = "DeferredTransaction")]
 pub struct DeferredTransactionPy {
-    tx: Arc<Mutex<Option<rbatis::RBatisTxExecutor>>>,
-    rb: RBatis,
+    tx: Arc<Mutex<Option<Arc<AsyncMutex<Box<dyn Connection>>>>>>,
+    pool: Arc<OnceLock<Box<dyn Pool>>>,
     handle: tokio::runtime::Handle,
 }
 
 #[pymethods]
 impl DeferredTransactionPy {
-    #[new]
-    fn new() -> Self {
-        DeferredTransactionPy {
-            tx: Arc::new(Mutex::new(None)),
-            rb: RBatis::new(),
-            handle: tokio::runtime::Handle::current(),
-        }
-    }
-
-    /// Acquire the transaction and set it on the DB. Called when entering `async with`.
     fn __aenter__<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let tx_arc = slf.borrow().tx.clone();
-        let rb = slf.borrow().rb.clone();
+        let pool = slf.borrow().pool.clone();
         let handle = slf.borrow().handle.clone();
         spawn_async(py, &handle, async move {
-            let tx = rb
-                .acquire_begin()
+            let p = get_pool(&pool)?;
+            let mut conn = acquire_conn(p).await?;
+            conn.begin()
                 .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Begin transaction failed: {}", e)))?;
-            *tx_arc.lock().unwrap() = Some(tx);
+            *tx_arc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))? = Some(Arc::new(AsyncMutex::new(conn)));
             Ok(())
         })
     }
 
-    /// Auto-commit or auto-rollback on exit.
     #[pyo3(signature = (exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __aexit__<'py>(
         &self,
@@ -1121,12 +1143,18 @@ impl DeferredTransactionPy {
         let tx_arc = self.tx.clone();
         let handle = self.handle.clone();
         spawn_async(py, &handle, async move {
-            let inner = tx_arc.lock().unwrap().take();
-            if let Some(t) = inner {
+            let conn_opt = tx_arc
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .take();
+            if let Some(conn_arc) = conn_opt {
+                let mut guard = conn_arc.lock().await;
                 if has_err {
-                    let _ = t.rollback().await;
+                    let _ = guard.rollback().await;
                 } else {
-                    t.commit().await
+                    guard
+                        .commit()
+                        .await
                         .map_err(|e| PyRuntimeError::new_err(format!("Commit failed: {}", e)))?;
                 }
             }
@@ -1141,13 +1169,12 @@ impl DeferredTransactionPy {
 
 #[pyclass(name = "Connection")]
 pub struct ConnectionPy {
-    inner: Arc<Mutex<Option<rbatis::executor::RBatisConnExecutor>>>,
+    inner: Arc<AsyncMutex<Option<Box<dyn Connection>>>>,
     handle: tokio::runtime::Handle,
 }
 
 #[pymethods]
 impl ConnectionPy {
-    /// Execute SQL (INSERT/UPDATE/DELETE) on this connection.
     #[pyo3(signature = (sql, params=None))]
     pub fn exec<'py>(
         &self,
@@ -1160,21 +1187,14 @@ impl ConnectionPy {
         let inner = self.inner.clone();
         let handle = self.handle.clone();
         spawn_async(py, &handle, async move {
-            let conn_executor = {
-                let guard = inner.lock().unwrap();
-                guard.as_ref()
-                    .ok_or_else(|| PyRuntimeError::new_err("Connection closed"))?
-                    .clone()
-            };
-            let r = conn_executor
-                .exec(&sql, args)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("SQL exec failed: {}", e)))?;
-            Ok(r.rows_affected as i64)
+            let mut guard = inner.lock().await;
+            let conn = guard
+                .as_mut()
+                .ok_or_else(|| PyRuntimeError::new_err("Connection closed"))?;
+            exec_on_conn(conn, &sql, args).await
         })
     }
 
-    /// Query on this connection. Returns List[Dict].
     #[pyo3(signature = (sql, params=None))]
     pub fn exec_decode<'py>(
         &self,
@@ -1187,56 +1207,52 @@ impl ConnectionPy {
         let inner = self.inner.clone();
         let handle = self.handle.clone();
         spawn_async(py, &handle, async move {
-            let conn_executor = {
-                let guard = inner.lock().unwrap();
-                guard.as_ref()
-                    .ok_or_else(|| PyRuntimeError::new_err("Connection closed"))?
-                    .clone()
-            };
-            let rows: Vec<Value> = conn_executor
-                .exec_decode(&sql, args)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("SQL query failed: {}", e)))?;
+            let mut guard = inner.lock().await;
+            let conn = guard
+                .as_mut()
+                .ok_or_else(|| PyRuntimeError::new_err("Connection closed"))?;
+            let rows = query_on_conn(conn, &sql, args).await?;
             Python::with_gil(|py| {
                 value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any())
             })
         })
     }
 
-    /// Begin a transaction on this connection.
-    /// Returns a `Transaction` object (explicit commit/rollback required).
     pub fn begin<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let handle = self.handle.clone();
         let handle2 = handle.clone();
         spawn_async(py, &handle, async move {
-            let conn_executor = inner
-                .lock()
-                .unwrap()
+            let mut guard = inner.lock().await;
+            let mut conn = guard
                 .take()
                 .ok_or_else(|| PyRuntimeError::new_err("Connection closed"))?;
-            let tx = conn_executor
-                .begin()
+            conn.begin()
                 .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Begin transaction failed: {}", e)))?;
-            let tx_id = tx.tx_id;
-            // Put the tx executor into a shared container so commit/rollback can take it back
-            let tx_container: Arc<Mutex<Option<rbatis::RBatisTxExecutor>>> =
-                Arc::new(Mutex::new(Some(tx)));
+            let conn_arc = Arc::new(AsyncMutex::new(conn));
             Python::with_gil(|py| {
-                let tx_obj = Bound::new(py, TransactionPy {
-                    tx_id,
-                    tx: tx_container,
-                    handle: handle2.clone(),
-                })?;
+                let tx_obj = Bound::new(
+                    py,
+                    TransactionPy {
+                        conn: conn_arc,
+                        tx_outer: Arc::new(Mutex::new(None)),
+                        handle: handle2.clone(),
+                    },
+                )?;
                 Ok(tx_obj.unbind().into_any())
             })
         })
     }
 
-    /// Close / release this connection back to the pool.
     pub fn close(&self) {
-        *self.inner.lock().unwrap() = None;
+        let inner = self.inner.clone();
+        let handle = self.handle.clone();
+        // Take the connection so it's dropped (returned to pool)
+        handle.spawn(async move {
+            let mut guard = inner.lock().await;
+            let _conn = guard.take();
+        });
     }
 }
 

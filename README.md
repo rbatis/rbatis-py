@@ -1,8 +1,8 @@
 # rbatis-py
 
-Python bindings for [rbatis](https://github.com/rbatis/rbatis) — a high-performance async ORM written in Rust.
+Python async database client powered by **rbdc** (Rust Database Connectivity) — a high-performance async database connectivity layer.
 
-Supports **SQLite**, **MySQL**, **PostgreSQL**, and **MSSQL**.
+Supports **SQLite**, **MySQL**, **PostgreSQL**, **MSSQL**, **Turso/libSQL**, and **DuckDB**.
 
 ## Installation
 
@@ -70,28 +70,28 @@ async def main():
 
 ### RBatis
 
-| Method | Description | Rust equivalent |
-|--------|-------------|-----------------|
-| `exec(sql, params)` | Execute INSERT/UPDATE/DELETE | `rb.exec(sql, args).await` |
-| `exec_decode(sql, params)` | Query returns `List[Dict]` | `rb.exec_decode::<Vec<Value>>(sql, args).await` |
-| `insert(table, data)` | Insert one row | `Model::insert(&rb, &table).await` |
-| `insert_batch(table, data_list)` | Batch insert | `Model::insert_batch(&rb, &tables, n).await` |
-| `select_by_map(table, condition)` | Select by condition | `Model::select_by_map(&rb, condition).await` |
-| `update_by_map(table, data, condition)` | Update by condition | `Model::update_by_map(&rb, &table, condition).await` |
-| `delete_by_map(table, condition)` | Delete by condition | `Model::delete_by_map(&rb, condition).await` |
-| `link(url)` | Connect to database | `rb.link(driver, url).await` |
-| `acquire()` | Acquire a raw connection from pool | `rb.acquire().await` |
-| `begin()` | Begin transaction (explicit, returns `Transaction`) | `rb.acquire_begin().await` |
-| `begin_defer()` | Begin transaction (auto context manager) | `rb.acquire_begin().await` |
-| `commit()` | Commit current active transaction | `tx.commit().await` |
-| `rollback()` | Rollback current active transaction | `tx.rollback().await` |
-| `ping()` | Test connection | `rb.exec("SELECT 1").await` |
-| `close()` | Close connection | — |
-| `set_pool_max_size(n)` | Set max connections in the pool | `pool.set_max_open_conns(n).await` |
-| `set_pool_max_idle(n)` | Set max idle connections in the pool | `pool.set_max_idle_conns(n).await` |
-| `set_pool_connect_timeout(s)` | Set connection timeout (seconds) | `pool.set_timeout(dur).await` |
-| `set_pool_max_lifetime(s)` | Set max connection lifetime (seconds) | `pool.set_conn_max_lifetime(dur).await` |
-| `pool_state()` | Inspect pool state (returns dict) | `pool.state().await` |
+| Method | Description |
+|--------|-------------|
+| `exec(sql, params)` | Execute INSERT/UPDATE/DELETE |
+| `exec_decode(sql, params)` | Query returns `List[Dict]` |
+| `insert(table, data)` | Insert one row |
+| `insert_batch(table, data_list)` | Batch insert |
+| `select_by_map(table, condition)` | Select by condition |
+| `update_by_map(table, data, condition)` | Update by condition |
+| `delete_by_map(table, condition)` | Delete by condition |
+| `link(url)` | Connect to database |
+| `acquire()` | Acquire a raw connection from pool |
+| `begin()` | Begin transaction (explicit, returns `Transaction`) |
+| `begin_defer()` | Begin transaction (auto context manager) |
+| `commit()` | Commit current active transaction |
+| `rollback()` | Rollback current active transaction |
+| `ping()` | Test connection |
+| `close()` | Close connection |
+| `set_pool_max_size(n)` | Set max connections in the pool |
+| `set_pool_max_idle(n)` | Set max idle connections in the pool |
+| `set_pool_connect_timeout(s)` | Set connection timeout (seconds) |
+| `set_pool_max_lifetime(s)` | Set max connection lifetime (seconds) |
+| `pool_state()` | Inspect pool state (returns dict) |
 
 ### Transaction
 
@@ -173,16 +173,16 @@ finally:
 
 ## Type Conversion
 
-Python types are automatically converted to/from rbatis extended types:
+Python types are automatically converted to/from rbdc extended types:
 
-| Python type | rbs serialization | Database type |
-|-------------|-------------------|---------------|
-| `datetime.datetime` | `Ext("DateTime", ...)` | `rbdc::DateTime` |
-| `datetime.date` | `Ext("Date", ...)` | `rbdc::Date` |
-| `datetime.time` | `Ext("Time", ...)` | `rbdc::Time` |
-| `decimal.Decimal` | `Ext("Decimal", ...)` | `rbdc::Decimal` |
-| `uuid.UUID` | `Ext("Uuid", ...)` | `rbdc::Uuid` |
-| `dict` / `list` | `Ext("Json", ...)` | `rbdc::Json` |
+| Python type | Database type |
+|-------------|---------------|
+| `datetime.datetime` | `DateTime` |
+| `datetime.date` | `Date` |
+| `datetime.time` | `Time` |
+| `decimal.Decimal` | `Decimal` |
+| `uuid.UUID` | `Uuid` |
+| `dict` / `list` | `Json` |
 
 **Note:** SQLite stores all types as TEXT; the conversion to Python types works for all databases.
 PostgreSQL returns timestamps as integer (milliseconds) rather than `datetime` objects.

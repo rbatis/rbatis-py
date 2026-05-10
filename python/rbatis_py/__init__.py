@@ -1,6 +1,7 @@
-"""rbatis-py – high-performance async ORM for Python, powered by rbatis (Rust).
+"""rbatis-py – high-performance async database client for Python.
 
-Supports SQLite, MySQL, PostgreSQL, MSSQL, Turso/libSQL, DuckDB.
+Backed by rbdc (Rust Database Connectivity). Supports SQLite, MySQL,
+PostgreSQL, MSSQL, Turso/libSQL, DuckDB.
 
 Usage:
 
@@ -51,7 +52,7 @@ DeferredTransaction = _DeferredTransaction
 
 
 class Model:
-    """Base class for table models (like rbatis ``crud!`` macro).
+    """Base class for table models.
 
     Subclasses must define ``__table__``:
 
