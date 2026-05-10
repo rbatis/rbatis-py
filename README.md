@@ -2,7 +2,12 @@
 
 Python async database client powered by **rbdc** (Rust Database Connectivity) — a high-performance async database connectivity layer.
 
-Supports **SQLite**, **MySQL**, **PostgreSQL**, **MSSQL**, **Turso/libSQL**, and **DuckDB**.
+Supports 
+- SQLite
+- MySQL
+- PostgreSQL
+- MSSQL
+- Turso/libSQL
 
 ## Installation
 

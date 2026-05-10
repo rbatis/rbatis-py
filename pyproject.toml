@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rbatis-py"
-version = "0.1.4"
+version = "0.1.5"
 description = "Python bindings for rbatis ORM - high-performance async ORM"
 authors = [{ name = "rbatis-py contributors" }]
 readme = "README.md"
