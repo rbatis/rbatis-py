@@ -136,7 +136,7 @@ async def test_conn_auto_commit(db: RBatis):
         async with tx.auto_commit() as g:
             await g.exec("INSERT INTO tx_test (id, val) VALUES (?, ?)", [9, "conn_tx"])
     finally:
-        await conn.close()
+        conn.close()
     rows = await db.exec_decode("SELECT id, val FROM tx_test WHERE id = ?", [9])
     assert len(rows) == 1, f"expected 1 row, got {len(rows)}"
     assert rows[0]["val"] == "conn_tx"

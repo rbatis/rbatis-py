@@ -151,7 +151,7 @@ try:
     async with tx.auto_commit() as g:
         await g.exec("INSERT INTO user (name) VALUES (?)", ["Alice"])
 finally:
-    await conn.close()  # return to pool
+    conn.close()  # return to pool (not async)
 ```
 
 ### Model
