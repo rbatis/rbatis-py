@@ -1,6 +1,6 @@
 """rbatis-py – high-performance async ORM for Python, powered by rbatis (Rust).
 
-Supports SQLite, MySQL, PostgreSQL, MSSQL.
+Supports SQLite, MySQL, PostgreSQL, MSSQL, Turso/libSQL, DuckDB.
 
 Usage:
 

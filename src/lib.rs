@@ -2,6 +2,8 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rbatis::RBatis;
+use rbdc_turso::TursoDriver;
+use rbdc_duckdb::DuckDbDriver;
 use rbs::value::map::ValueMap;
 use rbs::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -432,6 +434,32 @@ impl RbatisPy {
         })
     }
 
+    pub fn link_turso<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
+        let rb = self.rb.clone();
+        let connected = self.connected.clone();
+        let url = url.to_string();
+        spawn_async(py, &self.runtime.handle(), async move {
+            rb.link(TursoDriver {}, &url)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Turso connect failed: {}", e)))?;
+            connected.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
+    pub fn link_duckdb<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
+        let rb = self.rb.clone();
+        let connected = self.connected.clone();
+        let url = url.to_string();
+        spawn_async(py, &self.runtime.handle(), async move {
+            rb.link(DuckDbDriver {}, &url)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("DuckDB connect failed: {}", e)))?;
+            connected.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
     pub fn link<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
         if url.starts_with("sqlite://") {
             self.link_sqlite(py, url)
@@ -441,9 +469,13 @@ impl RbatisPy {
             self.link_postgres(py, url)
         } else if url.starts_with("jdbc:sqlserver://") || url.starts_with("mssql://") {
             self.link_mssql(py, url)
+        } else if url.starts_with("turso://") {
+            self.link_turso(py, url)
+        } else if url.starts_with("duckdb://") {
+            self.link_duckdb(py, url)
         } else {
             Err(PyValueError::new_err(format!(
-                "Unsupported URL scheme: {}. Supported: sqlite://, mysql://, postgres://, jdbc:sqlserver://",
+                "Unsupported URL scheme: {}. Supported: sqlite://, mysql://, postgres://, jdbc:sqlserver://, turso://, duckdb://",
                 url
             )))
         }
