@@ -96,6 +96,40 @@ async def main():
 
 ### Transaction
 
+| Method | Description |
+|--------|-------------|
+| `exec(sql, params)` | Execute SQL on the transaction connection |
+| `exec_decode(sql, params)` | Query returns `List[Dict]` |
+| `commit()` | Commit the transaction |
+| `rollback()` | Rollback the transaction |
+| `auto_commit()` | Return an `AutoCommitGuard` context manager |
+
+### AutoCommitGuard
+
+| Method | Description |
+|--------|-------------|
+| `exec(sql, params)` | Execute SQL on the transaction connection |
+| `exec_decode(sql, params)` | Query returns `List[Dict]` |
+| `commit()` | Commit explicitly (guard no-ops on exit) |
+| `rollback()` | Rollback explicitly (guard no-ops on exit) |
+
+Created by `Transaction.auto_commit()` or `RBatis.begin_defer()`. On context exit:
+- No exception → auto-commit
+- Exception → auto-rollback
+
+If `commit()` or `rollback()` is called explicitly inside the block, the guard does nothing on exit.
+
+### Connection
+
+| Method | Description |
+|--------|-------------|
+| `exec(sql, params)` | Execute SQL on this connection |
+| `exec_decode(sql, params)` | Query returns `List[Dict]` |
+| `begin()` | Begin a transaction (returns `Transaction`) |
+| `close()` | Release connection back to the pool (not async) |
+
+## Transaction Usage
+
 Three transaction modes are supported:
 
 **A) Explicit (manual commit/rollback):**

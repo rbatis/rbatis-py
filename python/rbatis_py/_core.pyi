@@ -1,4 +1,4 @@
-# Type stubs for rbatis_py._core (generated from Rust via PyO3)
+# Type stubs for rbatis_py._core (PyO3 native module)
 # This file provides type hints for IDE autocompletion.
 
 from typing import Any, Dict, List, Optional
@@ -19,9 +19,7 @@ class RBatis:
     async def link_duckdb(self, url: str) -> None: ...
 
     def is_connected(self) -> bool: ...
-
     async def ping(self) -> bool: ...
-
     def close(self) -> None: ...
 
     # --- Pool Configuration ---
@@ -29,7 +27,6 @@ class RBatis:
     async def set_pool_max_idle(self, max_idle: int) -> None: ...
     async def set_pool_connect_timeout(self, timeout_secs: int) -> None: ...
     async def set_pool_max_lifetime(self, lifetime_secs: int) -> None: ...
-
     async def pool_state(self) -> Dict[str, Any]: ...
 
     # --- Connection / Transaction ---
@@ -52,10 +49,7 @@ class RBatis:
         self, table: str, condition: Dict[str, Any]
     ) -> List[Dict[str, Any]]: ...
     async def update_by_map(
-        self,
-        table: str,
-        data: Dict[str, Any],
-        condition: Dict[str, Any],
+        self, table: str, data: Dict[str, Any], condition: Dict[str, Any]
     ) -> int: ...
     async def delete_by_map(self, table: str, condition: Dict[str, Any]) -> int: ...
 
@@ -73,19 +67,22 @@ class Transaction:
 
 
 class AutoCommitGuard:
-    """Async context manager with SQL execution. Auto-commits on success,
-    auto-rollbacks on exception.
+    """Async context manager with SQL execution.
+    Auto-commits on success, auto-rollbacks on exception.
 
-    Usage (from Transaction):
+    Usage:
         tx = await db.begin()
         async with tx.auto_commit() as g:
             await g.exec("INSERT ...")
-            # auto-commit or auto-rollback on exit
-
-    Usage (one-liner):
-        async with db.begin_defer() as g:
-            await g.exec("INSERT ...")
     """
+
+    async def __aenter__(self) -> "AutoCommitGuard": ...
+    async def __aexit__(
+        self,
+        exc_type: Optional[type],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[object],
+    ) -> Optional[bool]: ...
 
     async def exec(self, sql: str, params: Optional[List[Any]] = None) -> int: ...
     async def exec_decode(

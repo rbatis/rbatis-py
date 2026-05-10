@@ -23,16 +23,16 @@ Usage:
 
     # transaction (auto commit/rollback)
     tx = await db.begin()
-    async with tx.auto_commit():
-        await db.exec("UPDATE user SET name = ? WHERE id = ?", ["new", 1])
+    async with tx.auto_commit() as g:
+        await g.exec("UPDATE user SET name = ? WHERE id = ?", ["new", 1])
 """
 
 from typing import Any, Dict, List
 
-from rbatis_py._core import RBatis as _CoreRBatis
-from rbatis_py._core import Transaction as _Transaction
-from rbatis_py._core import AutoCommitGuard as _AutoCommitGuard
-from rbatis_py._core import Connection as _Connection
+from rbatis_py._core import RBatis
+from rbatis_py._core import Transaction
+from rbatis_py._core import AutoCommitGuard
+from rbatis_py._core import Connection
 from rbatis_py._core import __version__
 
 __all__ = [
@@ -43,13 +43,6 @@ __all__ = [
     "Model",
     "__version__",
 ]
-
-
-# Re-export core classes
-RBatis = _CoreRBatis
-Transaction = _Transaction
-AutoCommitGuard = _AutoCommitGuard
-Connection = _Connection
 
 
 class Model:
