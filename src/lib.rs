@@ -944,12 +944,14 @@ impl RbatisPy {
                 .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))? = Some(conn_arc.clone());
             let tx_clone = tx_arc.clone();
             let handle_clone = handle.clone();
+            let done = Arc::new(AtomicBool::new(false));
             Python::with_gil(|py| {
                 let tx_obj = Bound::new(
                     py,
                     TransactionPy {
                         conn: conn_arc.clone(),
                         tx_outer: tx_clone,
+                        done,
                         handle: handle_clone,
                     },
                 )?;
@@ -958,15 +960,23 @@ impl RbatisPy {
         })
     }
 
-    pub fn begin_defer<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, DeferredTransactionPy>> {
-        Bound::new(
-            py,
-            DeferredTransactionPy {
-                tx: self.tx_conn.clone(),
-                pool: self.pool.clone(),
-                handle: self.runtime.handle().clone(),
-            },
-        )
+    /// Convenience: `begin()` + `auto_commit()` in one step.
+    ///
+    /// ```python
+    /// async with db.begin_defer():
+    ///     await db.exec("INSERT ...")
+    ///     # auto-commits on success, auto-rollbacks on exception
+    /// ```
+    pub fn begin_defer<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        // Return the guard directly (no await). __aenter__ will acquire
+        // the connection and begin the transaction lazily.
+        let guard = AutoCommitGuard {
+            pool: Some(self.pool.clone()),
+            tx_outer: self.tx_conn.clone(),
+            done: Arc::new(AtomicBool::new(false)),
+            handle: self.runtime.handle().clone(),
+        };
+        Bound::new(py, guard).map(|b| b.unbind().into_any())
     }
 
     pub fn commit<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
@@ -1020,6 +1030,9 @@ pub struct TransactionPy {
     /// Shared reference to RbatisPy's tx_conn, so commit/rollback
     /// also clears the outer transaction reference.
     tx_outer: Arc<Mutex<Option<Arc<AsyncMutex<Box<dyn Connection>>>>>>,
+    /// Set to true when user explicitly calls commit() or rollback().
+    /// Checked by AutoCommitGuard to avoid double-commit.
+    done: Arc<AtomicBool>,
     handle: tokio::runtime::Handle,
 }
 
@@ -1066,6 +1079,7 @@ impl TransactionPy {
         let conn = self.conn.clone();
         let tx_outer = self.tx_outer.clone();
         let handle = self.handle.clone();
+        let done = self.done.clone();
         spawn_async(py, &handle, async move {
             let _outer = tx_outer
                 .lock()
@@ -1076,6 +1090,7 @@ impl TransactionPy {
                 .commit()
                 .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Commit failed: {}", e)))?;
+            done.store(true, Ordering::Relaxed);
             Ok(())
         })
     }
@@ -1084,6 +1099,7 @@ impl TransactionPy {
         let conn = self.conn.clone();
         let tx_outer = self.tx_outer.clone();
         let handle = self.handle.clone();
+        let done = self.done.clone();
         spawn_async(py, &handle, async move {
             let _outer = tx_outer
                 .lock()
@@ -1094,29 +1110,76 @@ impl TransactionPy {
                 .rollback()
                 .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Rollback failed: {}", e)))?;
+            done.store(true, Ordering::Relaxed);
             Ok(())
         })
+    }
+
+    /// Return an async context manager that auto-commits on success
+    /// or auto-rollbacks on exception when the block exits.
+    ///
+    /// Usage:
+    /// ```python
+    /// tx = await db.begin()
+    /// async with tx.auto_commit():
+    ///     await tx.exec("INSERT ...")
+    ///     await tx.exec("UPDATE ...")
+    ///     # auto-commit if no error, auto-rollback on exception
+    /// ```
+    ///
+    /// If you call `await tx.commit()` or `await tx.rollback()` explicitly
+    /// inside the block, the guard will do nothing on exit.
+    pub fn auto_commit<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, AutoCommitGuard>> {
+        let this = slf.borrow();
+        Bound::new(
+            py,
+            AutoCommitGuard {
+                pool: None,
+                tx_outer: this.tx_outer.clone(),
+                done: this.done.clone(),
+                handle: this.handle.clone(),
+            },
+        )
     }
 }
 
 // ============================================================
-//  DeferredTransaction (Auto / Context Manager) Python Class
+//  AutoCommitGuard — async context manager for Transaction
 // ============================================================
 
-/// DeferredTransaction — only created via `begin_defer()`.
-/// Python users cannot construct this directly.
-#[pyclass(name = "DeferredTransaction")]
-pub struct DeferredTransactionPy {
-    tx: Arc<Mutex<Option<Arc<AsyncMutex<Box<dyn Connection>>>>>>,
-    pool: Arc<OnceLock<Box<dyn Pool>>>,
+/// Handles auto-commit/rollback on context exit.
+///
+/// Two usage patterns:
+///
+/// 1. `auto_commit()` — connection already exists (from TransactionPy).
+///    `__aenter__` is a no-op.
+///
+/// 2. `begin_defer()` — lazy acquire+begin in `__aenter__`.
+///    `pool` field is set, `tx_outer` starts empty.
+#[pyclass(name = "AutoCommitGuard")]
+pub struct AutoCommitGuard {
+    /// Pool reference for lazy initialization (begin_defer pattern).
+    pool: Option<Arc<OnceLock<Box<dyn Pool>>>>,
+    /// Shared reference to RbatisPy's tx_conn. Connection is stored here
+    /// during __aenter__ (begin_defer) or was already set (auto_commit).
+    tx_outer: Arc<Mutex<Option<Arc<AsyncMutex<Box<dyn Connection>>>>>>,
+    /// Set to true when transaction is explicitly committed/rolled back,
+    /// or when __aexit__ has handled it. Prevents double-commit and Drop race.
+    done: Arc<AtomicBool>,
     handle: tokio::runtime::Handle,
 }
 
 #[pymethods]
-impl DeferredTransactionPy {
+impl AutoCommitGuard {
     fn __aenter__<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let tx_arc = slf.borrow().tx.clone();
         let pool = slf.borrow().pool.clone();
+        if pool.is_none() {
+            // auto_commit pattern — connection already available
+            return Ok(slf.unbind().into_any());
+        }
+        // begin_defer pattern — acquire connection and begin transaction
+        let pool = pool.unwrap();
+        let tx_outer = slf.borrow().tx_outer.clone();
         let handle = slf.borrow().handle.clone();
         spawn_async(py, &handle, async move {
             let p = get_pool(&pool)?;
@@ -1124,9 +1187,104 @@ impl DeferredTransactionPy {
             conn.begin()
                 .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Begin transaction failed: {}", e)))?;
-            *tx_arc
+            *tx_outer
                 .lock()
-                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))? = Some(Arc::new(AsyncMutex::new(conn)));
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))? =
+                Some(Arc::new(AsyncMutex::new(conn)));
+            Ok(())
+        })
+    }
+
+    /// Execute SQL on the transaction connection.
+    /// Works for both `auto_commit` and `begin_defer` patterns.
+    #[pyo3(signature = (sql, params=None))]
+    pub fn exec<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let args = collect_params(params)?;
+        let sql = sql.to_string();
+        let tx_outer = self.tx_outer.clone();
+        let handle = self.handle.clone();
+        spawn_async(py, &handle, async move {
+            let conn_opt = tx_outer
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .clone();
+            let conn_arc = conn_opt
+                .ok_or_else(|| PyRuntimeError::new_err("No active transaction"))?;
+            let mut guard = conn_arc.lock().await;
+            exec_on_conn(&mut *guard, &sql, args).await
+        })
+    }
+
+    /// Query on the transaction connection.
+    #[pyo3(signature = (sql, params=None))]
+    pub fn exec_decode<'py>(
+        &self,
+        py: Python<'py>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let args = collect_params(params)?;
+        let sql = sql.to_string();
+        let tx_outer = self.tx_outer.clone();
+        let handle = self.handle.clone();
+        spawn_async(py, &handle, async move {
+            let conn_opt = tx_outer
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .clone();
+            let conn_arc = conn_opt
+                .ok_or_else(|| PyRuntimeError::new_err("No active transaction"))?;
+            let mut guard = conn_arc.lock().await;
+            let rows = query_on_conn(&mut *guard, &sql, args).await?;
+            Python::with_gil(|py| {
+                value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any())
+            })
+        })
+    }
+
+    /// Commit the transaction explicitly. Guard will no-op on exit.
+    pub fn commit<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        let tx_outer = self.tx_outer.clone();
+        let done = self.done.clone();
+        let handle = self.handle.clone();
+        spawn_async(py, &handle, async move {
+            let conn_arc = tx_outer
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .take()
+                .ok_or_else(|| PyRuntimeError::new_err("No active transaction"))?;
+            let mut guard = conn_arc.lock().await;
+            guard
+                .commit()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Commit failed: {}", e)))?;
+            done.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
+    /// Rollback the transaction explicitly. Guard will no-op on exit.
+    pub fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        let tx_outer = self.tx_outer.clone();
+        let done = self.done.clone();
+        let handle = self.handle.clone();
+        spawn_async(py, &handle, async move {
+            let conn_arc = tx_outer
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .take()
+                .ok_or_else(|| PyRuntimeError::new_err("No active transaction"))?;
+            let mut guard = conn_arc.lock().await;
+            guard
+                .rollback()
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Rollback failed: {}", e)))?;
+            done.store(true, Ordering::Relaxed);
             Ok(())
         })
     }
@@ -1139,11 +1297,18 @@ impl DeferredTransactionPy {
         _exc_val: Option<&Bound<'py, PyAny>>,
         _exc_tb: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
+        // User already called tx.commit() or tx.rollback() — nothing to do.
+        if self.done.load(Ordering::Relaxed) {
+            return spawn_async(py, &self.handle, async move { Ok(false) });
+        }
         let has_err = exc_type.is_some();
-        let tx_arc = self.tx.clone();
+        let tx_outer = self.tx_outer.clone();
+        let done = self.done.clone();
         let handle = self.handle.clone();
         spawn_async(py, &handle, async move {
-            let conn_opt = tx_arc
+            // Mark done before the async task runs, so Drop sees it.
+            done.store(true, Ordering::Relaxed);
+            let conn_opt = tx_outer
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
                 .take();
@@ -1160,6 +1325,29 @@ impl DeferredTransactionPy {
             }
             Ok(false)
         })
+    }
+}
+
+/// Safety net: rollback if the guard was dropped without __aexit__
+/// being called (e.g. the Python object was garbage collected
+/// without entering the context).
+impl Drop for AutoCommitGuard {
+    fn drop(&mut self) {
+        if !self.done.load(Ordering::Relaxed) {
+            self.done.store(true, Ordering::Relaxed);
+            if let Some(conn_arc) = self
+                .tx_outer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                let handle = self.handle.clone();
+                handle.spawn(async move {
+                    let mut guard = conn_arc.lock().await;
+                    let _ = guard.rollback().await;
+                });
+            }
+        }
     }
 }
 
@@ -1231,12 +1419,14 @@ impl ConnectionPy {
                 .await
                 .map_err(|e| PyRuntimeError::new_err(format!("Begin transaction failed: {}", e)))?;
             let conn_arc = Arc::new(AsyncMutex::new(conn));
+            let done = Arc::new(AtomicBool::new(false));
             Python::with_gil(|py| {
                 let tx_obj = Bound::new(
                     py,
                     TransactionPy {
                         conn: conn_arc,
                         tx_outer: Arc::new(Mutex::new(None)),
+                        done,
                         handle: handle2.clone(),
                     },
                 )?;
@@ -1264,7 +1454,7 @@ impl ConnectionPy {
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RbatisPy>()?;
     m.add_class::<TransactionPy>()?;
-    m.add_class::<DeferredTransactionPy>()?;
+    m.add_class::<AutoCommitGuard>()?;
     m.add_class::<ConnectionPy>()?;
     m.add("__version__", "0.1.0")?;
     Ok(())

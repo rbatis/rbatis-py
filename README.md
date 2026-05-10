@@ -34,9 +34,10 @@ async def main():
     for row in rows:
         print(row["name"], row["age"])
 
-    # Transaction (auto mode)
-    async with db.begin_defer():
-        await db.exec("UPDATE user SET age = ? WHERE name = ?", [31, "Alice"])
+    # Transaction (auto commit/rollback)
+    tx = await db.begin()
+    async with tx.auto_commit() as g:
+        await g.exec("UPDATE user SET age = ? WHERE name = ?", [31, "Alice"])
 
 asyncio.run(main())
 ```
@@ -82,7 +83,7 @@ async def main():
 | `link(url)` | Connect to database |
 | `acquire()` | Acquire a raw connection from pool |
 | `begin()` | Begin transaction (explicit, returns `Transaction`) |
-| `begin_defer()` | Begin transaction (auto context manager) |
+| `begin_defer()` | Begin transaction with auto-commit guard |
 | `commit()` | Commit current active transaction |
 | `rollback()` | Rollback current active transaction |
 | `ping()` | Test connection |
@@ -95,7 +96,7 @@ async def main():
 
 ### Transaction
 
-Two transaction modes are supported:
+Three transaction modes are supported:
 
 **A) Explicit (manual commit/rollback):**
 
@@ -103,18 +104,36 @@ Two transaction modes are supported:
 tx = await db.begin()
 try:
     await tx.exec("INSERT INTO user (name) VALUES (?)", ["Alice"])
-    await tx.exec("INSERT INTO user (name) VALUES (?)", ["Bob"])
     await tx.commit()
 except Exception:
     await tx.rollback()
     raise
 ```
 
-**B) Auto (context manager):**
+**B) Auto-commit via `auto_commit()`:**
 
 ```python
-async with db.begin_defer():
-    await db.exec("INSERT INTO user (name) VALUES (?)", ["Alice"])
+tx = await db.begin()
+async with tx.auto_commit() as g:
+    await g.exec("INSERT INTO user (name) VALUES (?)", ["Alice"])
+    # auto-commit on success, auto-rollback on exception
+```
+
+If you call `await g.commit()` or `await g.rollback()` explicitly inside the block,
+the guard will no-op on exit:
+
+```python
+tx = await db.begin()
+async with tx.auto_commit() as g:
+    await g.exec("INSERT ...")
+    await g.commit()   # explicit commit — guard does nothing on exit
+```
+
+**C) One-liner via `begin_defer()`:**
+
+```python
+async with db.begin_defer() as g:
+    await g.exec("INSERT INTO user (name) VALUES (?)", ["Alice"])
     # auto-commit on success, auto-rollback on exception
 ```
 
@@ -129,12 +148,8 @@ try:
 
     # You can also begin a transaction on this specific connection
     tx = await conn.begin()
-    try:
-        await tx.exec("INSERT INTO user (name) VALUES (?)", ["Alice"])
-        await tx.commit()
-    except Exception:
-        await tx.rollback()
-        raise
+    async with tx.auto_commit() as g:
+        await g.exec("INSERT INTO user (name) VALUES (?)", ["Alice"])
 finally:
     await conn.close()  # return to pool
 ```
@@ -222,6 +237,38 @@ print(state)
 # e.g. {"max_open": 20, "connections": 3, "in_use": 1, "idle": 2, "waits": 0, ...}
 ```
 
+## Development
+
+```bash
+git clone https://github.com/rbatis/rbatis-py.git
+cd rbatis-py
+pip install maturin
+maturin develop  # build and install in current venv
+```
+
+### Running examples
+
+```bash
+uv run python examples/basic_usage.py     # exec, exec_decode, transactions
+uv run python examples/tx.py              # transaction patterns
+uv run python examples/crud_usage.py      # Model CRUD
+```
+
+## Publishing to PyPI
+
+```bash
+# Install maturin if not already installed
+pip install maturin
+
+# Build wheel
+maturin build
+
+# Publish to PyPI (requires PyPI account and API token)
+maturin publish
+
+# Or use the official GitHub Action:
+# https://github.com/PyO3/maturin-action
+```
 
 ## License
 

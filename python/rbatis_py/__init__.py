@@ -21,8 +21,9 @@ Usage:
     await User.insert(db, {"name": "Bob"})
     rows = await User.select_by_map(db, {"name": "Bob"})
 
-    # transaction
-    async with db.begin_defer():
+    # transaction (auto commit/rollback)
+    tx = await db.begin()
+    async with tx.auto_commit():
         await db.exec("UPDATE user SET name = ? WHERE id = ?", ["new", 1])
 """
 
@@ -30,15 +31,15 @@ from typing import Any, Dict, List
 
 from rbatis_py._core import RBatis as _CoreRBatis
 from rbatis_py._core import Transaction as _Transaction
+from rbatis_py._core import AutoCommitGuard as _AutoCommitGuard
 from rbatis_py._core import Connection as _Connection
-from rbatis_py._core import DeferredTransaction as _DeferredTransaction
 from rbatis_py._core import __version__
 
 __all__ = [
     "RBatis",
     "Transaction",
+    "AutoCommitGuard",
     "Connection",
-    "DeferredTransaction",
     "Model",
     "__version__",
 ]
@@ -47,8 +48,8 @@ __all__ = [
 # Re-export core classes
 RBatis = _CoreRBatis
 Transaction = _Transaction
+AutoCommitGuard = _AutoCommitGuard
 Connection = _Connection
-DeferredTransaction = _DeferredTransaction
 
 
 class Model:
