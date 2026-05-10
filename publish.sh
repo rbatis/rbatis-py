@@ -1,2 +1,2 @@
-echo %MATURIN_PYPI_TOKEN%
+echo $MATURIN_PYPI_TOKEN
 maturin publish
