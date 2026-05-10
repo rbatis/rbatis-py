@@ -15,6 +15,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use rbdc::db::Connection;
 use rbdc::pool::{ConnectionManager, Pool};
 use rbdc_pool_fast::FastPool;
+use rbdc_duckdb::DuckDbDriver;
 
 // Helper: iterate over a ValueMap entries
 fn value_map_iter(map: &rbs::value::map::ValueMap) -> impl Iterator<Item = (&Value, &Value)> {
@@ -517,6 +518,24 @@ impl RbatisPy {
         })
     }
 
+    fn link_duckdb<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
+        let pool = self.pool.clone();
+        let connected = self.connected.clone();
+        let url = url.to_string();
+        spawn_async(py, &self.runtime.handle(), async move {
+            let manager = ConnectionManager::new(DuckDbDriver {}, &url)
+                .map_err(|e| PyRuntimeError::new_err(format!("DuckDB init error: {}", e)))?;
+            let fast_pool = FastPool::new(manager).map_err(|e| {
+                PyRuntimeError::new_err(format!("DuckDB pool create failed: {}", e))
+            })?;
+            let _conn = acquire_conn(&fast_pool).await?;
+            pool.set(Box::new(fast_pool))
+                .map_err(|_| PyRuntimeError::new_err("Pool already initialized"))?;
+            connected.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
     pub fn link<'py>(&self, py: Python<'py>, url: &str) -> PyResult<Py<PyAny>> {
         if url.starts_with("sqlite://") {
             self.link_sqlite(py, url)
@@ -528,9 +547,11 @@ impl RbatisPy {
             self.link_mssql(py, url)
         } else if url.starts_with("turso://") {
             self.link_turso(py, url)
+        } else if url.starts_with("duckdb://") {
+            self.link_duckdb(py, url)
         } else {
             Err(PyValueError::new_err(format!(
-                "Unsupported URL scheme: {}. Supported: sqlite://, mysql://, postgres://, jdbc:sqlserver://, turso://",
+                "Unsupported URL scheme: {}. Supported: sqlite://, mysql://, postgres://, jdbc:sqlserver://, turso://, duckdb://",
                 url
             )))
         }

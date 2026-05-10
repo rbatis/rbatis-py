@@ -8,6 +8,7 @@ Supports
 - PostgreSQL
 - MSSQL
 - Turso/libSQL
+- DuckDB
 
 ## Installation
 

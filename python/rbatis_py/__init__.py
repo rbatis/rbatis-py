@@ -1,7 +1,7 @@
 """rbatis-py – high-performance async database client for Python.
 
 Backed by rbdc (Rust Database Connectivity). Supports SQLite, MySQL,
-PostgreSQL, MSSQL, Turso/libSQL.
+PostgreSQL, MSSQL, Turso/libSQL, DuckDB.
 
 Usage:
 

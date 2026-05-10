@@ -1,0 +1,6 @@
+# rbdc-sqlite (libsqlite3-sys) and rbdc-turso (libsql-ffi) both bundle
+# sqlite3 C code, causing LNK2005 on Windows MSVC.
+# /FORCE:MULTIPLE tells the linker to accept duplicate symbols and pick
+# the first definition (both are compatible sqlite3 implementations).
+[target.'cfg(windows)']
+rustflags = ["-C", "link-args=/FORCE:MULTIPLE"]
