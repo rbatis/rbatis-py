@@ -234,10 +234,10 @@ maturin develop  # build and install in current venv
 ### Running examples
 
 ```bash
-uv run python examples/basic_usage.py     # exec, exec_decode, transactions
-uv run python examples/crud_usage.py      # Model CRUD
-uv run python examples/crud_usage.py mysql     # with MySQL
-uv run python examples/crud_usage.py postgres  # with PostgreSQL
+uv run python examples/raw_sql.py     # exec, exec_decode, transactions
+uv run python examples/crud.py      # Model CRUD
+uv run python examples/crud.py mysql     # with MySQL
+uv run python examples/crud.py postgres  # with PostgreSQL
 ```
 
 ## Publishing to PyPI
