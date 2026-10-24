@@ -23,6 +23,8 @@ jobs:
   build-wheels:
     name: Build wheel - ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     strategy:
       fail-fast: false
       matrix:
@@ -44,7 +46,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          manylinux: auto
+          manylinux: "2_28"
           args: --release --locked --out dist
 
       - name: Upload wheel artifact
