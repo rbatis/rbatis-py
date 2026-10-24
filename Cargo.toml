@@ -1,6 +1,6 @@
 [package]
 name = "rbatis-py"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Python async database client powered by rbdc (Rust Database Connectivity)"
 
@@ -9,7 +9,7 @@ name = "rbatis_py"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py311"] }
 rbdc = { version = "4" }
 rbdc-pool-fast = { version = "4" }
 rbdc-sqlite = { version = "4" }
