@@ -1,10 +1,11 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use pyo3::IntoPyObjectExt;
 use rbs::value::map::ValueMap;
 use rbs::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -14,8 +15,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use rbdc::db::Connection;
 use rbdc::pool::{ConnectionManager, Pool};
-use rbdc_pool_fast::FastPool;
 use rbdc_duckdb::DuckDbDriver;
+use rbdc_pool_fast::FastPool;
 
 // Helper: iterate over a ValueMap entries
 fn value_map_iter(map: &rbs::value::map::ValueMap) -> impl Iterator<Item = (&Value, &Value)> {
@@ -32,7 +33,7 @@ fn py_to_rbs(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     }
 
     let py = value.py();
-    if let Ok(datetime_mod) = py.import_bound("datetime") {
+    if let Ok(datetime_mod) = py.import("datetime") {
         if let Ok(dt_class) = datetime_mod.getattr("datetime") {
             if value.is_instance(&dt_class).unwrap_or(false) {
                 let s = value.call_method0("isoformat")?.extract::<String>()?;
@@ -53,7 +54,7 @@ fn py_to_rbs(value: &Bound<'_, PyAny>) -> PyResult<Value> {
         }
     }
 
-    if let Ok(decimal_mod) = py.import_bound("decimal") {
+    if let Ok(decimal_mod) = py.import("decimal") {
         if let Ok(d_class) = decimal_mod.getattr("Decimal") {
             if value.is_instance(&d_class).unwrap_or(false) {
                 let s = value.call_method0("__str__")?.extract::<String>()?;
@@ -62,7 +63,7 @@ fn py_to_rbs(value: &Bound<'_, PyAny>) -> PyResult<Value> {
         }
     }
 
-    if let Ok(uuid_mod) = py.import_bound("uuid") {
+    if let Ok(uuid_mod) = py.import("uuid") {
         if let Ok(u_class) = uuid_mod.getattr("UUID") {
             if value.is_instance(&u_class).unwrap_or(false) {
                 let s = value.call_method0("__str__")?.extract::<String>()?;
@@ -83,14 +84,14 @@ fn py_to_rbs(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     if let Ok(s) = value.extract::<String>() {
         return Ok(Value::String(s));
     }
-    if let Ok(list) = value.downcast::<PyList>() {
+    if let Ok(list) = value.cast::<PyList>() {
         let mut arr = Vec::with_capacity(list.len());
         for item in list.iter() {
             arr.push(py_to_rbs(&item)?);
         }
         return Ok(Value::Array(arr));
     }
-    if let Ok(d) = value.downcast::<PyDict>() {
+    if let Ok(d) = value.cast::<PyDict>() {
         let mut map = ValueMap::new();
         for (k, v) in d.iter() {
             let key = k.extract::<String>().unwrap_or_default();
@@ -105,24 +106,24 @@ fn py_to_rbs(value: &Bound<'_, PyAny>) -> PyResult<Value> {
 fn rbs_to_py<'py>(value: &Value, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
     match value {
         Value::Null => Ok(py.None().into_bound(py)),
-        Value::Bool(b) => Ok(b.into_py(py).into_bound(py)),
-        Value::I32(i) => Ok(i.into_py(py).into_bound(py)),
-        Value::I64(i) => Ok(i.into_py(py).into_bound(py)),
-        Value::U32(u) => Ok(u.into_py(py).into_bound(py)),
-        Value::U64(u) => Ok(u.into_py(py).into_bound(py)),
-        Value::F32(f) => Ok(f.into_py(py).into_bound(py)),
-        Value::F64(f) => Ok(f.into_py(py).into_bound(py)),
-        Value::String(s) => Ok(s.into_py(py).into_bound(py)),
-        Value::Binary(b) => Ok(b.clone().into_py(py).into_bound(py)),
+        Value::Bool(b) => b.into_bound_py_any(py),
+        Value::I32(i) => i.into_bound_py_any(py),
+        Value::I64(i) => i.into_bound_py_any(py),
+        Value::U32(u) => u.into_bound_py_any(py),
+        Value::U64(u) => u.into_bound_py_any(py),
+        Value::F32(f) => f.into_bound_py_any(py),
+        Value::F64(f) => f.into_bound_py_any(py),
+        Value::String(s) => s.into_bound_py_any(py),
+        Value::Binary(b) => b.clone().into_bound_py_any(py),
         Value::Array(arr) => {
-            let py_list = PyList::empty_bound(py);
+            let py_list = PyList::empty(py);
             for item in arr {
                 py_list.append(rbs_to_py(item, py)?)?;
             }
             Ok(py_list.into_any())
         }
         Value::Map(map) => {
-            let py_dict = PyDict::new_bound(py);
+            let py_dict = PyDict::new(py);
             for (k, v) in value_map_iter(map) {
                 let key_str = match k {
                     Value::String(s) => s.clone(),
@@ -134,7 +135,7 @@ fn rbs_to_py<'py>(value: &Value, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>
         }
         Value::Ext("DateTime", inner) => {
             if let Value::String(s) = inner.as_ref() {
-                let dt_cls = py.import_bound("datetime")?.getattr("datetime")?;
+                let dt_cls = py.import("datetime")?.getattr("datetime")?;
                 let r = dt_cls.call_method1("fromisoformat", (s.clone(),))?;
                 Ok(r.into_any())
             } else {
@@ -148,11 +149,11 @@ fn rbs_to_py<'py>(value: &Value, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>
                     let y = parts[0].parse().unwrap_or(0);
                     let m: u32 = parts[1].parse().unwrap_or(1);
                     let d: u32 = parts[2].parse().unwrap_or(1);
-                    let dt = py.import_bound("datetime")?;
+                    let dt = py.import("datetime")?;
                     let r = dt.call_method1("date", (y, m, d))?;
                     Ok(r.into_any())
                 } else {
-                    Ok(s.into_py(py).into_bound(py))
+                    s.as_str().into_bound_py_any(py)
                 }
             } else {
                 rbs_to_py(inner.as_ref(), py)
@@ -160,7 +161,7 @@ fn rbs_to_py<'py>(value: &Value, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>
         }
         Value::Ext("Time", inner) => {
             if let Value::String(s) = inner.as_ref() {
-                let t_cls = py.import_bound("datetime")?.getattr("time")?;
+                let t_cls = py.import("datetime")?.getattr("time")?;
                 let r = t_cls.call_method1("fromisoformat", (s.clone(),))?;
                 Ok(r.into_any())
             } else {
@@ -169,7 +170,7 @@ fn rbs_to_py<'py>(value: &Value, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>
         }
         Value::Ext("Timestamp", inner) => match inner.as_ref() {
             Value::I64(ts) => {
-                let dt_cls = py.import_bound("datetime")?.getattr("datetime")?;
+                let dt_cls = py.import("datetime")?.getattr("datetime")?;
                 let r = dt_cls.call_method1("fromtimestamp", (*ts as f64 / 1000.0,))?;
                 Ok(r.into_any())
             }
@@ -177,7 +178,7 @@ fn rbs_to_py<'py>(value: &Value, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>
         },
         Value::Ext("Decimal", inner) => {
             if let Value::String(s) = inner.as_ref() {
-                let dec_cls = py.import_bound("decimal")?.getattr("Decimal")?;
+                let dec_cls = py.import("decimal")?.getattr("Decimal")?;
                 let r = dec_cls.call1((s.clone(),))?;
                 Ok(r.into_any())
             } else {
@@ -186,7 +187,7 @@ fn rbs_to_py<'py>(value: &Value, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>
         }
         Value::Ext("Uuid", inner) => {
             if let Value::String(s) = inner.as_ref() {
-                let uuid_cls = py.import_bound("uuid")?.getattr("UUID")?;
+                let uuid_cls = py.import("uuid")?.getattr("UUID")?;
                 let r = uuid_cls.call1((s.clone(),))?;
                 Ok(r.into_any())
             } else {
@@ -195,7 +196,7 @@ fn rbs_to_py<'py>(value: &Value, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>
         }
         Value::Ext("Json", inner) => {
             if let Value::String(s) = inner.as_ref() {
-                let json_mod = py.import_bound("json")?;
+                let json_mod = py.import("json")?;
                 let r = json_mod.call_method1("loads", (s.clone(),))?;
                 Ok(r.into_any())
             } else {
@@ -210,7 +211,7 @@ fn collect_params(params: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<Value>> {
     match params {
         None => Ok(Vec::new()),
         Some(p) => {
-            if let Ok(list) = p.downcast::<PyList>() {
+            if let Ok(list) = p.cast::<PyList>() {
                 let mut result = Vec::with_capacity(list.len());
                 for item in list.iter() {
                     result.push(py_to_rbs(&item)?);
@@ -280,7 +281,10 @@ fn raw_to_ext(v: &Value) -> Value {
                 // so we must verify the format before wrapping.
                 if u.0.len() == 36 {
                     let bytes = u.0.as_bytes();
-                    if bytes[8] == b'-' && bytes[13] == b'-' && bytes[18] == b'-' && bytes[23] == b'-'
+                    if bytes[8] == b'-'
+                        && bytes[13] == b'-'
+                        && bytes[18] == b'-'
+                        && bytes[23] == b'-'
                         && bytes.iter().all(|&c| c == b'-' || c.is_ascii_hexdigit())
                     {
                         return Value::Ext("Uuid", Box::new(Value::String(u.0)));
@@ -294,10 +298,10 @@ fn raw_to_ext(v: &Value) -> Value {
 }
 
 fn value_vec_to_pylist<'py>(vec: &[Value], py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-    let list = PyList::empty_bound(py);
+    let list = PyList::empty(py);
     for row in vec {
         if let Value::Map(ref m) = row {
-            let d = PyDict::new_bound(py);
+            let d = PyDict::new(py);
             for (k, v) in value_map_iter(m) {
                 let ks = match k {
                     Value::String(s) => s.clone(),
@@ -323,30 +327,35 @@ fn spawn_async<'py, F, R>(
 ) -> PyResult<Py<PyAny>>
 where
     F: Future<Output = PyResult<R>> + Send + 'static,
-    R: IntoPy<Py<PyAny>> + Send + 'static,
+    R: for<'a> IntoPyObject<'a> + Send + 'static,
 {
-    let cf_mod = py.import_bound("concurrent.futures")?;
+    let cf_mod = py.import("concurrent.futures")?;
     let cf: Bound<'_, PyAny> = cf_mod.call_method0("Future")?;
 
     let cf_clone: Py<PyAny> = cf.clone().unbind();
 
     handle.spawn(async move {
         let result = work.await;
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let cf = cf_clone.bind(py);
             match result {
-                Ok(val) => {
-                    let _ = cf.call_method1("set_result", (val,));
-                }
+                Ok(val) => match val.into_py_any(py) {
+                    Ok(val) => {
+                        let _ = cf.call_method1("set_result", (val,));
+                    }
+                    Err(err) => {
+                        let _ = cf.call_method1("set_exception", (err.into_value(py),));
+                    }
+                },
                 Err(err) => {
-                    let exc = err.into_py(py);
+                    let exc = err.into_value(py);
                     let _ = cf.call_method1("set_exception", (exc,));
                 }
             }
         });
     });
 
-    let asyncio = py.import_bound("asyncio")?;
+    let asyncio = py.import("asyncio")?;
     let awaitable = asyncio.call_method1("wrap_future", (cf,))?;
     Ok(awaitable.unbind())
 }
@@ -431,12 +440,9 @@ impl RbatisPy {
         spawn_async(py, &self.runtime.handle(), async move {
             let manager = ConnectionManager::new(rbdc_sqlite::driver::SqliteDriver {}, &url)
                 .map_err(|e| PyRuntimeError::new_err(format!("SQLite init error: {}", e)))?;
-            let fast_pool =
-                FastPool::new(manager)
-                    .map_err(|e| PyRuntimeError::new_err(format!(
-                        "SQLite pool create failed: {}",
-                        e
-                    )))?;
+            let fast_pool = FastPool::new(manager).map_err(|e| {
+                PyRuntimeError::new_err(format!("SQLite pool create failed: {}", e))
+            })?;
             // Test connection
             let _conn = acquire_conn(&fast_pool).await?;
             pool.set(Box::new(fast_pool))
@@ -453,9 +459,8 @@ impl RbatisPy {
         spawn_async(py, &self.runtime.handle(), async move {
             let manager = ConnectionManager::new(rbdc_mysql::driver::MysqlDriver {}, &url)
                 .map_err(|e| PyRuntimeError::new_err(format!("MySQL init error: {}", e)))?;
-            let fast_pool = FastPool::new(manager).map_err(|e| {
-                PyRuntimeError::new_err(format!("MySQL pool create failed: {}", e))
-            })?;
+            let fast_pool = FastPool::new(manager)
+                .map_err(|e| PyRuntimeError::new_err(format!("MySQL pool create failed: {}", e)))?;
             let _conn = acquire_conn(&fast_pool).await?;
             pool.set(Box::new(fast_pool))
                 .map_err(|_| PyRuntimeError::new_err("Pool already initialized"))?;
@@ -489,9 +494,8 @@ impl RbatisPy {
         spawn_async(py, &self.runtime.handle(), async move {
             let manager = ConnectionManager::new(rbdc_mssql::driver::MssqlDriver {}, &url)
                 .map_err(|e| PyRuntimeError::new_err(format!("MSSQL init error: {}", e)))?;
-            let fast_pool = FastPool::new(manager).map_err(|e| {
-                PyRuntimeError::new_err(format!("MSSQL pool create failed: {}", e))
-            })?;
+            let fast_pool = FastPool::new(manager)
+                .map_err(|e| PyRuntimeError::new_err(format!("MSSQL pool create failed: {}", e)))?;
             let _conn = acquire_conn(&fast_pool).await?;
             pool.set(Box::new(fast_pool))
                 .map_err(|_| PyRuntimeError::new_err("Pool already initialized"))?;
@@ -507,9 +511,8 @@ impl RbatisPy {
         spawn_async(py, &self.runtime.handle(), async move {
             let manager = ConnectionManager::new(rbdc_turso::TursoDriver {}, &url)
                 .map_err(|e| PyRuntimeError::new_err(format!("Turso init error: {}", e)))?;
-            let fast_pool = FastPool::new(manager).map_err(|e| {
-                PyRuntimeError::new_err(format!("Turso pool create failed: {}", e))
-            })?;
+            let fast_pool = FastPool::new(manager)
+                .map_err(|e| PyRuntimeError::new_err(format!("Turso pool create failed: {}", e)))?;
             let _conn = acquire_conn(&fast_pool).await?;
             pool.set(Box::new(fast_pool))
                 .map_err(|_| PyRuntimeError::new_err("Pool already initialized"))?;
@@ -613,7 +616,7 @@ impl RbatisPy {
         spawn_async(py, &self.runtime.handle(), async move {
             let p = get_pool(&pool)?;
             let state = p.state().await;
-            Ok(Python::with_gil(|py| {
+            Ok(Python::attach(|py| {
                 rbs_to_py(&state, py).map(|v| v.unbind().into_any())
             })?)
         })
@@ -688,9 +691,7 @@ impl RbatisPy {
                 let mut conn = acquire_conn(p).await?;
                 query_on_conn(&mut conn, &sql, args).await?
             };
-            Python::with_gil(|py| {
-                value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any())
-            })
+            Python::attach(|py| value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any()))
         })
     }
 
@@ -741,7 +742,7 @@ impl RbatisPy {
 
         let mut rows: Vec<(Vec<String>, Vec<Value>)> = Vec::new();
         for item in data.iter() {
-            if let Ok(d) = item.downcast::<PyDict>() {
+            if let Ok(d) = item.cast::<PyDict>() {
                 let (c, v) = py_dict_to_columns_values(&d)?;
                 if !c.is_empty() {
                     rows.push((c, v));
@@ -824,7 +825,9 @@ impl RbatisPy {
         let (sc, mut sv) = py_dict_to_columns_values(data)?;
         let (wc, wv) = py_dict_to_columns_values(condition)?;
         if sc.is_empty() || wc.is_empty() {
-            return Err(PyValueError::new_err("update_by_map needs data + condition"));
+            return Err(PyValueError::new_err(
+                "update_by_map needs data + condition",
+            ));
         }
         let set = sc
             .iter()
@@ -887,9 +890,7 @@ impl RbatisPy {
                 let mut conn = acquire_conn(p).await?;
                 query_on_conn(&mut conn, &sql, wv).await?
             };
-            Python::with_gil(|py| {
-                value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any())
-            })
+            Python::attach(|py| value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any()))
         })
     }
 
@@ -939,7 +940,7 @@ impl RbatisPy {
                 inner: Arc::new(AsyncMutex::new(Some(conn))),
                 handle: handle.clone(),
             };
-            Python::with_gil(|py| Bound::new(py, py_conn).map(|b| b.unbind().into_any()))
+            Python::attach(|py| Bound::new(py, py_conn).map(|b| b.unbind().into_any()))
         })
     }
 
@@ -956,11 +957,12 @@ impl RbatisPy {
             let conn_arc = Arc::new(AsyncMutex::new(conn));
             *tx_arc
                 .lock()
-                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))? = Some(conn_arc.clone());
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))? =
+                Some(conn_arc.clone());
             let tx_clone = tx_arc.clone();
             let handle_clone = handle.clone();
             let done = Arc::new(AtomicBool::new(false));
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let tx_obj = Bound::new(
                     py,
                     TransactionPy {
@@ -1085,9 +1087,7 @@ impl TransactionPy {
         spawn_async(py, &handle, async move {
             let mut guard = conn.lock().await;
             let rows = query_on_conn(&mut *guard, &sql, args).await?;
-            Python::with_gil(|py| {
-                value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any())
-            })
+            Python::attach(|py| value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any()))
         })
     }
 
@@ -1145,7 +1145,10 @@ impl TransactionPy {
     ///
     /// If you call `await tx.commit()` or `await tx.rollback()` explicitly
     /// inside the block, the guard will do nothing on exit.
-    pub fn auto_commit<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, AutoCommitGuard>> {
+    pub fn auto_commit<'py>(
+        slf: Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, AutoCommitGuard>> {
         let this = slf.borrow();
         Bound::new(
             py,
@@ -1276,9 +1279,7 @@ impl AutoCommitGuard {
             let conn_arc = guard_get_conn(&conn_opt, &tx_outer)?;
             let mut guard = conn_arc.lock().await;
             let rows = query_on_conn(&mut *guard, &sql, args).await?;
-            Python::with_gil(|py| {
-                value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any())
-            })
+            Python::attach(|py| value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any()))
         })
     }
 
@@ -1291,7 +1292,10 @@ impl AutoCommitGuard {
         spawn_async(py, &handle, async move {
             let conn_arc = guard_get_conn(&conn_opt, &tx_outer)?;
             // Clear tx_outer if using self.conn (auto_commit pattern)
-            let _outer = tx_outer.lock().map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?.take();
+            let _outer = tx_outer
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .take();
             let mut guard = conn_arc.lock().await;
             guard
                 .commit()
@@ -1310,7 +1314,10 @@ impl AutoCommitGuard {
         let handle = self.handle.clone();
         spawn_async(py, &handle, async move {
             let conn_arc = guard_get_conn(&conn_opt, &tx_outer)?;
-            let _outer = tx_outer.lock().map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?.take();
+            let _outer = tx_outer
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .take();
             let mut guard = conn_arc.lock().await;
             guard
                 .rollback()
@@ -1343,7 +1350,10 @@ impl AutoCommitGuard {
                 Ok(c) => c,
                 Err(_) => return Ok(false),
             };
-            let _outer = tx_outer.lock().map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?.take();
+            let _outer = tx_outer
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock error: {}", e)))?
+                .take();
             let mut guard = conn_arc.lock().await;
             if has_err {
                 let _ = guard.rollback().await;
@@ -1361,9 +1371,12 @@ impl AutoCommitGuard {
 impl AutoCommitGuard {
     fn drop_take_conn(&mut self) -> Option<Arc<AsyncMutex<Box<dyn Connection>>>> {
         // Prefer self.conn (auto_commit pattern), then tx_outer (begin_defer)
-        self.conn
-            .take()
-            .or_else(|| self.tx_outer.lock().unwrap_or_else(|e| e.into_inner()).take())
+        self.conn.take().or_else(|| {
+            self.tx_outer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        })
     }
 }
 
@@ -1434,9 +1447,7 @@ impl ConnectionPy {
                 .as_mut()
                 .ok_or_else(|| PyRuntimeError::new_err("Connection closed"))?;
             let rows = query_on_conn(conn, &sql, args).await?;
-            Python::with_gil(|py| {
-                value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any())
-            })
+            Python::attach(|py| value_vec_to_pylist(&rows, py).map(|l| l.unbind().into_any()))
         })
     }
 
@@ -1454,7 +1465,7 @@ impl ConnectionPy {
                 .map_err(|e| PyRuntimeError::new_err(format!("Begin transaction failed: {}", e)))?;
             let conn_arc = Arc::new(AsyncMutex::new(conn));
             let done = Arc::new(AtomicBool::new(false));
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let tx_obj = Bound::new(
                     py,
                     TransactionPy {
